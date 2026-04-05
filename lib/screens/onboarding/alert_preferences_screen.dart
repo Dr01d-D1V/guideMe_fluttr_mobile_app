@@ -140,7 +140,7 @@ class _AlertPreferencesScreenState
         automaticallyImplyLeading: false,
         bottom: const PreferredSize(
           preferredSize: Size.fromHeight(20),
-          child: _StepIndicator(currentStep: 2, totalSteps: 3),
+          child: _StepIndicator(currentStep: 1, totalSteps: 2),
         ),
       ),
       body: ListView(
