@@ -24,19 +24,58 @@ enum _Transport {
   final String label;
 }
 
-// ─── Trip data model ──────────────────────────────────────────────────────────
+// ─── Stop entry ───────────────────────────────────────────────────────────────
+// Each stop has a location, optional arrive time, and optional depart time.
+// Very first stop of day → no arriveTime. Very last stop of day → no departTime.
+
+class _StopEntry {
+  LocationResult? location;
+  String label = '';
+  TimeOfDay? arriveTime;
+  TimeOfDay? departTime;
+
+  _StopEntry({this.arriveTime, this.departTime});
+}
+
+// ─── Segment routes ───────────────────────────────────────────────────────────
+
+class _SegmentRoutes {
+  List<RouteOption> routes = [];
+  int selectedIndex = 0;
+  bool isLoading = false;
+  String? error;
+}
+
+// ─── Trip entry ───────────────────────────────────────────────────────────────
 
 class _TripEntry {
-  LocationResult? from;
-  String fromLabel = '';
-  LocationResult? to;
-  String toLabel = '';
   _Transport transport = _Transport.car;
-  TimeOfDay departTime = const TimeOfDay(hour: 7, minute: 30);
-  List<RouteOption> routes = [];
-  int selectedRouteIndex = 0;
-  bool isLoadingRoutes = false;
-  String? routeError;
+  List<_StopEntry> stops = [];
+  List<_SegmentRoutes> segmentRoutes = [];
+
+  _TripEntry() {
+    stops = [
+      _StopEntry(departTime: const TimeOfDay(hour: 7, minute: 30)),
+      _StopEntry(arriveTime: const TimeOfDay(hour: 8, minute: 0)),
+    ];
+    segmentRoutes = [_SegmentRoutes()];
+  }
+
+  _TripEntry.copy(_TripEntry src) {
+    transport = src.transport;
+    stops = src.stops.map((s) {
+      final c = _StopEntry(arriveTime: s.arriveTime, departTime: s.departTime);
+      c.location = s.location;
+      c.label = s.label;
+      return c;
+    }).toList();
+    segmentRoutes = src.segmentRoutes.map((_) => _SegmentRoutes()).toList();
+  }
+
+  int get segmentCount => stops.length - 1;
+
+  bool segmentReady(int segIdx) =>
+      stops[segIdx].location != null && stops[segIdx + 1].location != null;
 }
 
 // ─── Main screen ──────────────────────────────────────────────────────────────
@@ -50,9 +89,7 @@ class TravelPatternScreen extends ConsumerStatefulWidget {
 }
 
 class _TravelPatternScreenState extends ConsumerState<TravelPatternScreen> {
-  static const _dayNames = [
-    'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'
-  ];
+  static const _dayNames = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
   static const _dayFull = [
     'Monday', 'Tuesday', 'Wednesday', 'Thursday',
     'Friday', 'Saturday', 'Sunday'
@@ -68,7 +105,7 @@ class _TravelPatternScreenState extends ConsumerState<TravelPatternScreen> {
   };
 
   GoogleMapController? _mapController;
-  LatLng _mapCenter = const LatLng(9.0579, 7.4951); // Abuja fallback
+  LatLng _mapCenter = const LatLng(9.0579, 7.4951);
   Set<Marker> _markers = {};
   Set<Polyline> _polylines = {};
   bool _isSubmitting = false;
@@ -99,60 +136,74 @@ class _TravelPatternScreenState extends ConsumerState<TravelPatternScreen> {
 
   List<_TripEntry> get _currentTrips => _tripsByDay[_selectedDay]!;
 
-  // ─── Map overlays ────────────────────────────────────────────────────────────
+  bool _isVeryFirstStop(int tripIdx, int stopIdx) =>
+      tripIdx == 0 && stopIdx == 0;
+
+  bool _isVeryLastStop(int tripIdx, int stopIdx) =>
+      tripIdx == _currentTrips.length - 1 &&
+      stopIdx == _currentTrips[tripIdx].stops.length - 1;
+
+  // ─── Map overlays ─────────────────────────────────────────────────────────
 
   void _refreshMapOverlays() {
     final markers = <Marker>{};
     final polylines = <Polyline>{};
 
-    for (final (i, trip) in _currentTrips.indexed) {
-      if (trip.from != null) {
+    for (int t = 0; t < _currentTrips.length; t++) {
+      final trip = _currentTrips[t];
+      for (int s = 0; s < trip.stops.length; s++) {
+        final stop = trip.stops[s];
+        if (stop.location == null) continue;
+        final pos = LatLng(stop.location!.lat, stop.location!.lng);
+        final isFirst = s == 0;
+        final isLast = s == trip.stops.length - 1;
         markers.add(Marker(
-          markerId: MarkerId('from_${_selectedDay}_$i'),
-          position: LatLng(trip.from!.lat, trip.from!.lng),
+          markerId: MarkerId('stop_${_selectedDay}_${t}_$s'),
+          position: pos,
           icon: BitmapDescriptor.defaultMarkerWithHue(
-              BitmapDescriptor.hueGreen),
+            isFirst
+                ? BitmapDescriptor.hueGreen
+                : isLast
+                    ? BitmapDescriptor.hueRed
+                    : BitmapDescriptor.hueOrange,
+          ),
           infoWindow: InfoWindow(
-              title:
-                  trip.fromLabel.isNotEmpty ? trip.fromLabel : 'Start'),
+            title: stop.label.isNotEmpty ? stop.label : 'Stop ${s + 1}',
+          ),
         ));
       }
-      if (trip.to != null) {
-        markers.add(Marker(
-          markerId: MarkerId('to_${_selectedDay}_$i'),
-          position: LatLng(trip.to!.lat, trip.to!.lng),
-          icon:
-              BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueRed),
-          infoWindow: InfoWindow(
-              title: trip.toLabel.isNotEmpty ? trip.toLabel : 'End'),
-        ));
-      }
-      if (trip.routes.isNotEmpty &&
-          trip.selectedRouteIndex < trip.routes.length) {
-        final route = trip.routes[trip.selectedRouteIndex];
-        if (route.points.isNotEmpty) {
-          polylines.add(Polyline(
-            polylineId: PolylineId('route_${_selectedDay}_$i'),
-            color: const Color(0xFF2563EB),
-            width: 4,
-            points: route.points
-                .map((p) =>
-                    LatLng(p['lat'] ?? 0.0, p['lng'] ?? 0.0))
-                .toList(),
-          ));
-        } else if (trip.from != null && trip.to != null) {
-          // Draw straight line if no polyline data returned
-          polylines.add(Polyline(
-            polylineId: PolylineId('route_${_selectedDay}_$i'),
-            color: const Color(0xFF2563EB),
-            width: 3,
-            patterns: [PatternItem.dash(12), PatternItem.gap(8)],
-            points: [
-              LatLng(trip.from!.lat, trip.from!.lng),
-              LatLng(trip.to!.lat, trip.to!.lng),
-            ],
-          ));
+
+      for (int seg = 0; seg < trip.segmentCount; seg++) {
+        if (seg >= trip.segmentRoutes.length) continue;
+        final sr = trip.segmentRoutes[seg];
+        final fromStop = trip.stops[seg];
+        final toStop = trip.stops[seg + 1];
+        if (fromStop.location == null || toStop.location == null) continue;
+
+        if (sr.routes.isNotEmpty && sr.selectedIndex < sr.routes.length) {
+          final route = sr.routes[sr.selectedIndex];
+          if (route.points.isNotEmpty) {
+            polylines.add(Polyline(
+              polylineId: PolylineId('seg_${_selectedDay}_${t}_$seg'),
+              color: const Color(0xFF2563EB),
+              width: 4,
+              points: route.points
+                  .map((p) => LatLng(p['lat'] ?? 0.0, p['lng'] ?? 0.0))
+                  .toList(),
+            ));
+            continue;
+          }
         }
+        polylines.add(Polyline(
+          polylineId: PolylineId('seg_${_selectedDay}_${t}_$seg'),
+          color: const Color(0xFF2563EB),
+          width: 3,
+          patterns: [PatternItem.dash(12), PatternItem.gap(8)],
+          points: [
+            LatLng(fromStop.location!.lat, fromStop.location!.lng),
+            LatLng(toStop.location!.lat, toStop.location!.lng),
+          ],
+        ));
       }
     }
 
@@ -162,51 +213,51 @@ class _TravelPatternScreenState extends ConsumerState<TravelPatternScreen> {
     });
   }
 
-  // ─── Route fetching ──────────────────────────────────────────────────────────
+  // ─── Route fetching ───────────────────────────────────────────────────────
 
-  Future<void> _fetchRoutes(int dayIdx, int tripIdx) async {
+  Future<void> _fetchSegment(int dayIdx, int tripIdx, int segIdx) async {
     final trip = _tripsByDay[dayIdx]![tripIdx];
-    if (trip.from == null || trip.to == null) return;
+    if (!trip.segmentReady(segIdx)) return;
+    if (segIdx >= trip.segmentRoutes.length) return;
 
     setState(() {
-      _tripsByDay[dayIdx]![tripIdx].isLoadingRoutes = true;
-      _tripsByDay[dayIdx]![tripIdx].routeError = null;
-      _tripsByDay[dayIdx]![tripIdx].routes = [];
+      trip.segmentRoutes[segIdx].isLoading = true;
+      trip.segmentRoutes[segIdx].error = null;
+      trip.segmentRoutes[segIdx].routes = [];
     });
 
     try {
+      final fromLoc = trip.stops[segIdx].location!;
+      final toLoc = trip.stops[segIdx + 1].location!;
       final api = ref.read(apiServiceProvider);
       final routes = await api.fetchRouteOptions(
-        trip.from!.lat,
-        trip.from!.lng,
-        trip.to!.lat,
-        trip.to!.lng,
+        fromLoc.lat, fromLoc.lng,
+        toLoc.lat, toLoc.lng,
       );
       if (mounted) {
         setState(() {
-          _tripsByDay[dayIdx]![tripIdx].routes = routes;
-          _tripsByDay[dayIdx]![tripIdx].selectedRouteIndex = 0;
-          _tripsByDay[dayIdx]![tripIdx].isLoadingRoutes = false;
+          trip.segmentRoutes[segIdx].routes = routes;
+          trip.segmentRoutes[segIdx].selectedIndex = 0;
+          trip.segmentRoutes[segIdx].isLoading = false;
         });
         _refreshMapOverlays();
       }
     } catch (e) {
       if (mounted) {
         setState(() {
-          _tripsByDay[dayIdx]![tripIdx].isLoadingRoutes = false;
-          _tripsByDay[dayIdx]![tripIdx].routeError = e.toString();
+          trip.segmentRoutes[segIdx].isLoading = false;
+          trip.segmentRoutes[segIdx].error = e.toString();
         });
       }
     }
   }
 
-  // ─── Location picker ─────────────────────────────────────────────────────────
+  // ─── Location picker ──────────────────────────────────────────────────────
 
-  Future<void> _pickLocation(int tripIdx, bool isFrom) async {
-    final trip = _currentTrips[tripIdx];
-    final existing = isFrom ? trip.from : trip.to;
-    final initial = existing != null
-        ? LatLng(existing.lat, existing.lng)
+  Future<void> _pickLocation(int tripIdx, int stopIdx) async {
+    final stop = _currentTrips[tripIdx].stops[stopIdx];
+    final initial = stop.location != null
+        ? LatLng(stop.location!.lat, stop.location!.lng)
         : _mapCenter;
 
     final result = await Navigator.of(context).push<LocationResult>(
@@ -219,49 +270,227 @@ class _TravelPatternScreenState extends ConsumerState<TravelPatternScreen> {
     if (result == null || !mounted) return;
 
     setState(() {
-      if (isFrom) {
-        _tripsByDay[_selectedDay]![tripIdx].from = result;
-        _tripsByDay[_selectedDay]![tripIdx].fromLabel = result.address;
-      } else {
-        _tripsByDay[_selectedDay]![tripIdx].to = result;
-        _tripsByDay[_selectedDay]![tripIdx].toLabel = result.address;
-      }
+      _tripsByDay[_selectedDay]![tripIdx].stops[stopIdx].location = result;
+      _tripsByDay[_selectedDay]![tripIdx].stops[stopIdx].label = result.address;
     });
-
     _refreshMapOverlays();
 
-    // Auto-fetch routes when both ends are set
-    final updatedTrip = _tripsByDay[_selectedDay]![tripIdx];
-    if (updatedTrip.from != null && updatedTrip.to != null) {
-      await _fetchRoutes(_selectedDay, tripIdx);
+    final trip = _tripsByDay[_selectedDay]![tripIdx];
+    if (stopIdx > 0 && trip.segmentReady(stopIdx - 1)) {
+      await _fetchSegment(_selectedDay, tripIdx, stopIdx - 1);
+    }
+    if (stopIdx < trip.segmentCount && trip.segmentReady(stopIdx)) {
+      await _fetchSegment(_selectedDay, tripIdx, stopIdx);
     }
   }
 
-  // ─── Time picker ─────────────────────────────────────────────────────────────
+  // ─── Add waypoint ─────────────────────────────────────────────────────────
 
-  Future<void> _pickTime(int tripIdx) async {
-    final current = _currentTrips[tripIdx].departTime;
-    final picked =
-        await showTimePicker(context: context, initialTime: current);
-    if (picked != null && mounted) {
-      setState(
-          () => _tripsByDay[_selectedDay]![tripIdx].departTime = picked);
-    }
+  void _addWaypoint(int tripIdx) {
+    final trip = _tripsByDay[_selectedDay]![tripIdx];
+    final insertAt = trip.stops.length - 1;
+    setState(() {
+      trip.stops.insert(
+        insertAt,
+        _StopEntry(
+          arriveTime: const TimeOfDay(hour: 12, minute: 0),
+          departTime: const TimeOfDay(hour: 12, minute: 30),
+        ),
+      );
+      trip.segmentRoutes.insert(insertAt, _SegmentRoutes());
+      if (insertAt < trip.segmentRoutes.length) {
+        trip.segmentRoutes[insertAt].routes = [];
+        trip.segmentRoutes[insertAt].error = null;
+      }
+    });
   }
 
-  // ─── Submit ──────────────────────────────────────────────────────────────────
+  // ─── Remove stop ──────────────────────────────────────────────────────────
+
+  void _removeStop(int tripIdx, int stopIdx) {
+    final trip = _tripsByDay[_selectedDay]![tripIdx];
+    if (trip.stops.length <= 2) return;
+    setState(() {
+      trip.stops.removeAt(stopIdx);
+      final segIdx = stopIdx > 0 ? stopIdx - 1 : 0;
+      if (segIdx < trip.segmentRoutes.length) {
+        trip.segmentRoutes.removeAt(segIdx);
+      }
+    });
+    _refreshMapOverlays();
+  }
+
+  // ─── Time picker ──────────────────────────────────────────────────────────
+
+  Future<void> _pickStopTime(int tripIdx, int stopIdx, bool isDeparture) async {
+    final stop = _currentTrips[tripIdx].stops[stopIdx];
+    final current = isDeparture
+        ? (stop.departTime ?? const TimeOfDay(hour: 8, minute: 0))
+        : (stop.arriveTime ?? const TimeOfDay(hour: 9, minute: 0));
+    final picked = await showTimePicker(context: context, initialTime: current);
+    if (picked == null || !mounted) return;
+    setState(() {
+      if (isDeparture) {
+        _tripsByDay[_selectedDay]![tripIdx].stops[stopIdx].departTime = picked;
+      } else {
+        _tripsByDay[_selectedDay]![tripIdx].stops[stopIdx].arriveTime = picked;
+      }
+    });
+  }
+
+  // ─── Copy day sheet ───────────────────────────────────────────────────────
+
+  Future<void> _showCopyDaySheet() async {
+    if (_currentTrips.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('No trips on this day to copy.')),
+      );
+      return;
+    }
+
+    final selected = List<bool>.generate(7, (_) => false);
+    String? errorMsg;
+
+    await showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (ctx, setSheetState) {
+            return Padding(
+              padding: const EdgeInsets.fromLTRB(24, 20, 24, 32),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      const Expanded(
+                        child: Text(
+                          'Copy trips to other days',
+                          style: TextStyle(
+                              fontSize: 17, fontWeight: FontWeight.w700),
+                        ),
+                      ),
+                      IconButton(
+                        icon: const Icon(Icons.close),
+                        onPressed: () => Navigator.pop(ctx),
+                        visualDensity: VisualDensity.compact,
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    'Copies all trips from ${_dayFull[_selectedDay]}. You can edit any day afterward.',
+                    style: TextStyle(color: Colors.grey[600], fontSize: 13),
+                  ),
+                  const SizedBox(height: 16),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: List.generate(7, (i) {
+                      if (i == _selectedDay) {
+                        return Chip(
+                          label: Text(_dayFull[i]),
+                          backgroundColor: const Color(0xFFEFF6FF),
+                          labelStyle: const TextStyle(
+                              color: Color(0xFF2563EB),
+                              fontWeight: FontWeight.w600),
+                          avatar: const Icon(Icons.check_circle,
+                              size: 16, color: Color(0xFF2563EB)),
+                        );
+                      }
+                      final isOn = selected[i];
+                      return FilterChip(
+                        label: Text(_dayFull[i]),
+                        selected: isOn,
+                        onSelected: (v) =>
+                            setSheetState(() => selected[i] = v),
+                        selectedColor: const Color(0xFFEFF6FF),
+                        checkmarkColor: const Color(0xFF2563EB),
+                        labelStyle: TextStyle(
+                          color: isOn
+                              ? const Color(0xFF2563EB)
+                              : Colors.black87,
+                          fontWeight:
+                              isOn ? FontWeight.w600 : FontWeight.normal,
+                        ),
+                        side: BorderSide(
+                          color: isOn
+                              ? const Color(0xFF2563EB)
+                              : Colors.grey[300]!,
+                        ),
+                      );
+                    }),
+                  ),
+                  if (errorMsg != null) ...[
+                    const SizedBox(height: 8),
+                    Text(errorMsg!,
+                        style: const TextStyle(
+                            color: Colors.red, fontSize: 12)),
+                  ],
+                  const SizedBox(height: 20),
+                  FilledButton.icon(
+                    onPressed: () {
+                      final targets = List.generate(7, (i) => i)
+                          .where((i) => selected[i])
+                          .toList();
+                      if (targets.isEmpty) {
+                        setSheetState(
+                            () => errorMsg = 'Select at least one day.');
+                        return;
+                      }
+                      setState(() {
+                        for (final day in targets) {
+                          _tripsByDay[day] = _currentTrips
+                              .map((t) => _TripEntry.copy(t))
+                              .toList();
+                        }
+                      });
+                      Navigator.pop(ctx);
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(
+                          content: Text(
+                            'Copied to ${targets.map((i) => _dayFull[i]).join(', ')}',
+                          ),
+                          backgroundColor: const Color(0xFF2563EB),
+                        ),
+                      );
+                    },
+                    icon: const Icon(Icons.copy_all_rounded),
+                    label: const Text('Copy trips'),
+                    style: FilledButton.styleFrom(
+                      backgroundColor: const Color(0xFF2563EB),
+                      minimumSize: const Size(double.infinity, 48),
+                      shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(12)),
+                    ),
+                  ),
+                ],
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  // ─── Submit ───────────────────────────────────────────────────────────────
 
   Future<void> _submit() async {
     final allTrips = _tripsByDay.values
         .expand((list) => list)
-        .where((t) => t.from != null && t.to != null)
+        .where((t) => t.stops.every((s) => s.location != null))
         .toList();
 
     if (allTrips.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
             content: Text(
-                'Please add at least one complete trip (from → to).')),
+                'Please complete at least one trip with all locations set.')),
       );
       return;
     }
@@ -273,27 +502,47 @@ class _TravelPatternScreenState extends ConsumerState<TravelPatternScreen> {
       final routeEntries = <RouteEntry>[];
 
       for (int d = 0; d < 7; d++) {
-        for (final trip in _tripsByDay[d]!) {
-          if (trip.from == null || trip.to == null) continue;
+        final trips = _tripsByDay[d]!;
+        for (int ti = 0; ti < trips.length; ti++) {
+          final trip = trips[ti];
+          if (trip.stops.any((s) => s.location == null)) continue;
+
+          final stopPayloads = trip.stops.asMap().entries.map((e) {
+            final idx = e.key;
+            final s = e.value;
+            return {
+              'location': s.location!.toJson(),
+              'label': s.label,
+              if (s.arriveTime != null)
+                'arrive_time':
+                    '${s.arriveTime!.hour.toString().padLeft(2, '0')}:'
+                    '${s.arriveTime!.minute.toString().padLeft(2, '0')}',
+              if (s.departTime != null)
+                'depart_time':
+                    '${s.departTime!.hour.toString().padLeft(2, '0')}:'
+                    '${s.departTime!.minute.toString().padLeft(2, '0')}',
+              'stop_index': idx,
+            };
+          }).toList();
+
           tripPayloads.add({
             'day': _dayKeys[d],
-            'from': trip.from!.toJson(),
-            'from_label': trip.fromLabel,
-            'to': trip.to!.toJson(),
-            'to_label': trip.toLabel,
+            'trip_index': ti,
             'transport': trip.transport.label.toLowerCase(),
-            'depart_time':
-                '${trip.departTime.hour.toString().padLeft(2, '0')}:'
-                '${trip.departTime.minute.toString().padLeft(2, '0')}',
+            'stops': stopPayloads,
           });
 
-          if (trip.routes.isNotEmpty) {
-            final sel = trip.routes[trip.selectedRouteIndex];
+          for (int seg = 0; seg < trip.segmentCount; seg++) {
+            if (seg >= trip.segmentRoutes.length) continue;
+            final sr = trip.segmentRoutes[seg];
+            if (sr.routes.isEmpty) continue;
+            final sel = sr.routes[sr.selectedIndex];
             routeEntries.add(RouteEntry(
               tripLabel:
-                  '${trip.fromLabel} → ${trip.toLabel} (${_dayFull[d]})',
-              fromDestinationId: trip.fromLabel,
-              toDestinationId: trip.toLabel,
+                  '${trip.stops[seg].label} -> ${trip.stops[seg + 1].label} '
+                  '(${_dayFull[d]}, trip ${ti + 1}, seg ${seg + 1})',
+              fromDestinationId: trip.stops[seg].label,
+              toDestinationId: trip.stops[seg + 1].label,
               estimatedDurationMinutes: sel.durationMinutes,
               roadNames: sel.roadNames,
               preferred: true,
@@ -326,15 +575,24 @@ class _TravelPatternScreenState extends ConsumerState<TravelPatternScreen> {
     }
   }
 
-  // ─── Build ────────────────────────────────────────────────────────────────────
+  // ─── Build ────────────────────────────────────────────────────────────────
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Plan Your Trips'),
+        title: const Text('Set Your Trips'),
         centerTitle: true,
         automaticallyImplyLeading: false,
+        actions: [
+          Tooltip(
+            message: 'Copy today\'s trips to other days',
+            child: IconButton(
+              icon: const Icon(Icons.copy_all_rounded),
+              onPressed: _showCopyDaySheet,
+            ),
+          ),
+        ],
         bottom: const PreferredSize(
           preferredSize: Size.fromHeight(20),
           child: _StepIndicator(currentStep: 0, totalSteps: 2),
@@ -342,9 +600,9 @@ class _TravelPatternScreenState extends ConsumerState<TravelPatternScreen> {
       ),
       body: Column(
         children: [
-          // ── Map preview ─────────────────────────────────────────────────
+          // ── Map preview ────────────────────────────────────────────────
           SizedBox(
-            height: MediaQuery.of(context).size.height * 0.33,
+            height: MediaQuery.of(context).size.height * 0.30,
             child: Stack(
               children: [
                 GoogleMap(
@@ -361,7 +619,6 @@ class _TravelPatternScreenState extends ConsumerState<TravelPatternScreen> {
                   myLocationButtonEnabled: false,
                   zoomControlsEnabled: false,
                 ),
-                // My location FAB
                 Positioned(
                   bottom: 12,
                   right: 12,
@@ -376,7 +633,7 @@ class _TravelPatternScreenState extends ConsumerState<TravelPatternScreen> {
                         );
                         _mapController?.animateCamera(
                           CameraUpdate.newLatLngZoom(
-                              LatLng(pos.latitude, pos.longitude), 14),
+                            LatLng(pos.latitude, pos.longitude), 14),
                         );
                       } catch (_) {}
                     },
@@ -388,7 +645,7 @@ class _TravelPatternScreenState extends ConsumerState<TravelPatternScreen> {
             ),
           ),
 
-          // ── Day selector ─────────────────────────────────────────────────
+          // ── Day selector ───────────────────────────────────────────────
           Container(
             color: Colors.white,
             padding: const EdgeInsets.symmetric(vertical: 10),
@@ -441,8 +698,7 @@ class _TravelPatternScreenState extends ConsumerState<TravelPatternScreen> {
                               decoration: BoxDecoration(
                                 shape: BoxShape.circle,
                                 color: isSelected
-                                    ? Colors.white
-                                        .withValues(alpha: 0.8)
+                                    ? Colors.white.withValues(alpha: 0.8)
                                     : const Color(0xFF2563EB),
                               ),
                             ),
@@ -458,7 +714,7 @@ class _TravelPatternScreenState extends ConsumerState<TravelPatternScreen> {
 
           const Divider(height: 1),
 
-          // ── Trip list ─────────────────────────────────────────────────────
+          // ── Trip list ──────────────────────────────────────────────────
           Expanded(
             child: ListView(
               padding: const EdgeInsets.all(16),
@@ -474,12 +730,11 @@ class _TravelPatternScreenState extends ConsumerState<TravelPatternScreen> {
                         Text(
                           'No trips for ${_dayFull[_selectedDay]}',
                           style: const TextStyle(
-                              fontWeight: FontWeight.w600,
-                              fontSize: 15),
+                              fontWeight: FontWeight.w600, fontSize: 15),
                         ),
                         const SizedBox(height: 4),
                         Text(
-                          'Tap below to add where you\'ll go\nand when.',
+                          'Tap below to add where you\'ll go and when.',
                           textAlign: TextAlign.center,
                           style: TextStyle(
                               color: Colors.grey[500], height: 1.5),
@@ -494,16 +749,19 @@ class _TravelPatternScreenState extends ConsumerState<TravelPatternScreen> {
                       key: ValueKey('trip_${_selectedDay}_$i'),
                       index: i,
                       trip: _currentTrips[i],
-                      onPickFrom: () => _pickLocation(i, true),
-                      onPickTo: () => _pickLocation(i, false),
-                      onPickTime: () => _pickTime(i),
+                      isFirstTrip: i == 0,
+                      isLastTrip: i == _currentTrips.length - 1,
+                      onPickLocation: (stopIdx) => _pickLocation(i, stopIdx),
+                      onAddWaypoint: () => _addWaypoint(i),
+                      onRemoveStop: (stopIdx) => _removeStop(i, stopIdx),
+                      onPickStopTime: (stopIdx, isDep) =>
+                          _pickStopTime(i, stopIdx, isDep),
                       onTransportChanged: (t) => setState(
-                          () => _tripsByDay[_selectedDay]![i].transport =
-                              t),
-                      onSelectRoute: (ri) {
-                        setState(() =>
-                            _tripsByDay[_selectedDay]![i]
-                                .selectedRouteIndex = ri);
+                          () => _tripsByDay[_selectedDay]![i].transport = t),
+                      onSelectRoute: (segIdx, ri) {
+                        setState(() => _tripsByDay[_selectedDay]![i]
+                            .segmentRoutes[segIdx]
+                            .selectedIndex = ri);
                         _refreshMapOverlays();
                       },
                       onDelete: () {
@@ -511,7 +769,10 @@ class _TravelPatternScreenState extends ConsumerState<TravelPatternScreen> {
                             () => _tripsByDay[_selectedDay]!.removeAt(i));
                         _refreshMapOverlays();
                       },
-                      onRetry: () => _fetchRoutes(_selectedDay, i),
+                      onRetry: (segIdx) =>
+                          _fetchSegment(_selectedDay, i, segIdx),
+                      isVeryFirstStop: _isVeryFirstStop,
+                      isVeryLastStop: _isVeryLastStop,
                     ),
                   ),
 
@@ -546,8 +807,7 @@ class _TravelPatternScreenState extends ConsumerState<TravelPatternScreen> {
                         )
                       : const Text('Continue',
                           style: TextStyle(
-                              fontSize: 16,
-                              fontWeight: FontWeight.w600)),
+                              fontSize: 16, fontWeight: FontWeight.w600)),
                 ),
                 const SizedBox(height: 24),
               ],
@@ -564,25 +824,35 @@ class _TravelPatternScreenState extends ConsumerState<TravelPatternScreen> {
 class _TripCard extends StatelessWidget {
   final int index;
   final _TripEntry trip;
-  final VoidCallback onPickFrom;
-  final VoidCallback onPickTo;
-  final VoidCallback onPickTime;
+  final bool isFirstTrip;
+  final bool isLastTrip;
+  final ValueChanged<int> onPickLocation;
+  final VoidCallback onAddWaypoint;
+  final ValueChanged<int> onRemoveStop;
+  final void Function(int stopIdx, bool isDeparture) onPickStopTime;
   final ValueChanged<_Transport> onTransportChanged;
-  final ValueChanged<int> onSelectRoute;
+  final void Function(int segIdx, int routeIdx) onSelectRoute;
   final VoidCallback onDelete;
-  final VoidCallback onRetry;
+  final ValueChanged<int> onRetry;
+  final bool Function(int tripIdx, int stopIdx) isVeryFirstStop;
+  final bool Function(int tripIdx, int stopIdx) isVeryLastStop;
 
   const _TripCard({
     super.key,
     required this.index,
     required this.trip,
-    required this.onPickFrom,
-    required this.onPickTo,
-    required this.onPickTime,
+    required this.isFirstTrip,
+    required this.isLastTrip,
+    required this.onPickLocation,
+    required this.onAddWaypoint,
+    required this.onRemoveStop,
+    required this.onPickStopTime,
     required this.onTransportChanged,
     required this.onSelectRoute,
     required this.onDelete,
     required this.onRetry,
+    required this.isVeryFirstStop,
+    required this.isVeryLastStop,
   });
 
   @override
@@ -610,8 +880,8 @@ class _TripCard extends StatelessWidget {
             Row(
               children: [
                 Container(
-                  padding: const EdgeInsets.symmetric(
-                      horizontal: 10, vertical: 4),
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
                   decoration: BoxDecoration(
                     color: const Color(0xFFEFF6FF),
                     borderRadius: BorderRadius.circular(20),
@@ -643,273 +913,389 @@ class _TripCard extends StatelessWidget {
 
             const SizedBox(height: 14),
 
-            // From / To with dotted connector
-            _LocationButton(
-              icon: Icons.circle,
-              iconColor: const Color(0xFF22C55E),
-              label: trip.fromLabel.isNotEmpty
-                  ? trip.fromLabel
-                  : 'Set starting point',
-              isEmpty: trip.fromLabel.isEmpty,
-              onTap: onPickFrom,
-            ),
-            Padding(
-              padding: const EdgeInsets.only(left: 11, top: 4, bottom: 4),
-              child: Column(
-                children: List.generate(
-                  3,
-                  (_) => Container(
-                    margin: const EdgeInsets.symmetric(vertical: 2),
-                    width: 2,
-                    height: 5,
-                    decoration: BoxDecoration(
-                      color: Colors.grey[300],
-                      borderRadius: BorderRadius.circular(1),
-                    ),
-                  ),
-                ),
-              ),
-            ),
-            _LocationButton(
-              icon: Icons.location_on_rounded,
-              iconColor: const Color(0xFF2563EB),
-              label:
-                  trip.toLabel.isNotEmpty ? trip.toLabel : 'Set destination',
-              isEmpty: trip.toLabel.isEmpty,
-              onTap: onPickTo,
+            // Transport
+            _TransportDropdown(
+              value: trip.transport,
+              onChanged: onTransportChanged,
             ),
 
-            const SizedBox(height: 14),
-            Divider(color: Colors.grey[100]),
-            const SizedBox(height: 10),
+            const SizedBox(height: 16),
 
-            // Transport + departure time row
-            Row(
-              children: [
-                Expanded(
-                  child: _TransportDropdown(
-                    value: trip.transport,
-                    onChanged: onTransportChanged,
-                  ),
-                ),
-                const SizedBox(width: 10),
-                GestureDetector(
-                  onTap: onPickTime,
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(
-                        horizontal: 12, vertical: 9),
-                    decoration: BoxDecoration(
-                      color: Colors.grey[50],
-                      borderRadius: BorderRadius.circular(10),
-                      border: Border.all(color: Colors.grey[200]!),
+            // Stops list with timeline
+            ...List.generate(trip.stops.length, (si) {
+              final stop = trip.stops[si];
+              final isFirstOfDay = isFirstTrip && si == 0;
+              final isLastOfDay = isLastTrip && si == trip.stops.length - 1;
+              final isIntermediate = !isFirstOfDay && !isLastOfDay;
+              final isLastStop = si == trip.stops.length - 1;
+              final canRemove = trip.stops.length > 2;
+
+              Color dotColor = const Color(0xFF2563EB);
+              if (isFirstOfDay) dotColor = const Color(0xFF22C55E);
+              if (isLastOfDay) dotColor = const Color(0xFFEF4444);
+
+              return Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  // Arrival time chip (not on first stop of the day)
+                  if (!isFirstOfDay && stop.arriveTime != null)
+                    Padding(
+                      padding: const EdgeInsets.only(left: 24, bottom: 4),
+                      child: _TimeChip(
+                        label: 'Arrive',
+                        time: stop.arriveTime!,
+                        color: const Color(0xFFEF4444),
+                        onTap: () => onPickStopTime(si, false),
+                      ),
                     ),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        const Icon(Icons.access_time_rounded,
-                            size: 15, color: Color(0xFF2563EB)),
+
+                  // Stop row
+                  Row(
+                    crossAxisAlignment: CrossAxisAlignment.center,
+                    children: [
+                      // Timeline dot
+                      Container(
+                        width: 14,
+                        height: 14,
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          color: dotColor,
+                          border:
+                              Border.all(color: Colors.white, width: 2),
+                          boxShadow: [
+                            BoxShadow(
+                              color: dotColor.withValues(alpha: 0.35),
+                              blurRadius: 6,
+                            )
+                          ],
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: _LocationButton(
+                          label: stop.label.isNotEmpty
+                              ? stop.label
+                              : (isFirstOfDay
+                                  ? 'Set starting point'
+                                  : isLastOfDay
+                                      ? 'Set final destination'
+                                      : 'Set waypoint $si'),
+                          isEmpty: stop.label.isEmpty,
+                          onTap: () => onPickLocation(si),
+                        ),
+                      ),
+                      if (isIntermediate && canRemove) ...[
                         const SizedBox(width: 6),
-                        Text(
-                          trip.departTime.format(context),
-                          style: const TextStyle(
-                              fontWeight: FontWeight.w600,
-                              fontSize: 13),
+                        GestureDetector(
+                          onTap: () => onRemoveStop(si),
+                          child: Container(
+                            padding: const EdgeInsets.all(5),
+                            decoration: BoxDecoration(
+                              color: Colors.red[50],
+                              borderRadius: BorderRadius.circular(6),
+                            ),
+                            child: Icon(Icons.remove_circle_outline,
+                                color: Colors.red[300], size: 16),
+                          ),
                         ),
                       ],
-                    ),
-                  ),
-                ),
-              ],
-            ),
-
-            // Routes section (only shown when both ends pinned)
-            if (trip.from != null && trip.to != null) ...[
-              const SizedBox(height: 14),
-              Divider(color: Colors.grey[100]),
-              const SizedBox(height: 12),
-
-              if (trip.isLoadingRoutes)
-                const Padding(
-                  padding: EdgeInsets.symmetric(vertical: 8),
-                  child: Row(
-                    children: [
-                      SizedBox(
-                        height: 14,
-                        width: 14,
-                        child: CircularProgressIndicator(strokeWidth: 2),
-                      ),
-                      SizedBox(width: 10),
-                      Text(
-                        'Finding best routes…',
-                        style: TextStyle(
-                            color: Colors.grey, fontSize: 13),
-                      ),
                     ],
                   ),
-                )
-              else if (trip.routeError != null)
-                Row(
-                  children: [
-                    Icon(Icons.warning_amber_rounded,
-                        size: 16, color: Colors.orange[600]),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: Text(
-                        'Routes unavailable',
-                        style: TextStyle(
-                            color: Colors.grey[600], fontSize: 13),
+
+                  // Departure time chip (not on last stop of the day)
+                  if (!isLastOfDay && stop.departTime != null)
+                    Padding(
+                      padding: const EdgeInsets.only(left: 24, top: 4),
+                      child: _TimeChip(
+                        label: 'Depart',
+                        time: stop.departTime!,
+                        color: const Color(0xFF22C55E),
+                        onTap: () => onPickStopTime(si, true),
                       ),
                     ),
-                    TextButton(
-                      onPressed: onRetry,
-                      style: TextButton.styleFrom(
-                          visualDensity: VisualDensity.compact),
-                      child: const Text('Retry',
-                          style: TextStyle(fontSize: 12)),
+
+                  // Segment connector + route cards
+                  if (!isLastStop)
+                    _SegmentConnector(
+                      segIdx: si,
+                      sr: si < trip.segmentRoutes.length
+                          ? trip.segmentRoutes[si]
+                          : null,
+                      onSelectRoute: onSelectRoute,
+                      onRetry: onRetry,
                     ),
-                  ],
-                )
-              else if (trip.routes.isEmpty)
-                Row(
-                  children: [
-                    Icon(Icons.info_outline,
-                        size: 15, color: Colors.grey[400]),
-                    const SizedBox(width: 8),
-                    Text(
-                      'No routes returned from server',
+                ],
+              );
+            }),
+
+            const SizedBox(height: 10),
+            TextButton.icon(
+              onPressed: onAddWaypoint,
+              icon: const Icon(Icons.add_location_alt_outlined, size: 16),
+              label: const Text('Add stop / waypoint',
+                  style: TextStyle(fontSize: 13)),
+              style: TextButton.styleFrom(
+                foregroundColor: const Color(0xFF2563EB),
+                visualDensity: VisualDensity.compact,
+                padding: EdgeInsets.zero,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ─── Segment connector + inline route cards ───────────────────────────────────
+
+class _SegmentConnector extends StatelessWidget {
+  final int segIdx;
+  final _SegmentRoutes? sr;
+  final void Function(int, int) onSelectRoute;
+  final ValueChanged<int> onRetry;
+
+  const _SegmentConnector({
+    required this.segIdx,
+    required this.sr,
+    required this.onSelectRoute,
+    required this.onRetry,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(left: 6),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _dots(),
+          if (sr != null && sr!.isLoading)
+            Padding(
+              padding: const EdgeInsets.only(left: 8, top: 2, bottom: 2),
+              child: Row(
+                children: [
+                  const SizedBox(
+                    height: 12,
+                    width: 12,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  ),
+                  const SizedBox(width: 8),
+                  Text('Finding routes...',
                       style: TextStyle(
-                          color: Colors.grey[500], fontSize: 13),
-                    ),
-                  ],
-                )
-              else ...[
-                Row(
-                  children: [
-                    const Text('Suggested Routes',
+                          color: Colors.grey[500], fontSize: 12)),
+                ],
+              ),
+            ),
+          if (sr != null && !sr!.isLoading && sr!.error != null)
+            Padding(
+              padding: const EdgeInsets.only(left: 8, top: 2, bottom: 2),
+              child: Row(
+                children: [
+                  Icon(Icons.warning_amber_rounded,
+                      size: 14, color: Colors.orange[600]),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text('Routes unavailable',
                         style: TextStyle(
-                            fontWeight: FontWeight.w700, fontSize: 13)),
-                    const Spacer(),
-                    Container(
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 8, vertical: 3),
-                      decoration: BoxDecoration(
-                        color: const Color(0xFFEFF6FF),
-                        borderRadius: BorderRadius.circular(20),
-                      ),
-                      child: Text(
-                        '${trip.routes.length} route${trip.routes.length > 1 ? 's' : ''}',
-                        style: const TextStyle(
-                            color: Color(0xFF2563EB),
-                            fontSize: 11,
-                            fontWeight: FontWeight.w600),
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 10),
-                ...List.generate(trip.routes.length, (ri) {
-                  final route = trip.routes[ri];
-                  final isSelected = ri == trip.selectedRouteIndex;
-                  final isBest = ri == 0;
-                  return GestureDetector(
-                    onTap: () => onSelectRoute(ri),
-                    child: AnimatedContainer(
-                      duration: const Duration(milliseconds: 180),
-                      margin: const EdgeInsets.only(bottom: 8),
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 12, vertical: 10),
-                      decoration: BoxDecoration(
-                        color: isSelected
-                            ? const Color(0xFFEFF6FF)
-                            : Colors.grey[50],
-                        border: Border.all(
+                            color: Colors.grey[500], fontSize: 12)),
+                  ),
+                  TextButton(
+                    onPressed: () => onRetry(segIdx),
+                    style: TextButton.styleFrom(
+                        visualDensity: VisualDensity.compact),
+                    child: const Text('Retry',
+                        style: TextStyle(fontSize: 12)),
+                  ),
+                ],
+              ),
+            ),
+          if (sr != null &&
+              !sr!.isLoading &&
+              sr!.error == null &&
+              sr!.routes.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(left: 8, top: 4, bottom: 4),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Route options',
+                    style: TextStyle(
+                        fontSize: 11,
+                        color: Colors.grey[500],
+                        fontWeight: FontWeight.w600),
+                  ),
+                  const SizedBox(height: 6),
+                  ...List.generate(sr!.routes.length, (ri) {
+                    final route = sr!.routes[ri];
+                    final isSelected = ri == sr!.selectedIndex;
+                    final isBest = ri == 0;
+                    return GestureDetector(
+                      onTap: () => onSelectRoute(segIdx, ri),
+                      child: AnimatedContainer(
+                        duration: const Duration(milliseconds: 160),
+                        margin: const EdgeInsets.only(bottom: 6),
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 10, vertical: 8),
+                        decoration: BoxDecoration(
                           color: isSelected
-                              ? const Color(0xFF2563EB)
-                              : Colors.grey[200]!,
-                          width: isSelected ? 1.5 : 1,
-                        ),
-                        borderRadius: BorderRadius.circular(10),
-                      ),
-                      child: Row(
-                        children: [
-                          Icon(
-                            Icons.route_outlined,
-                            size: 18,
+                              ? const Color(0xFFEFF6FF)
+                              : Colors.grey[50],
+                          border: Border.all(
                             color: isSelected
                                 ? const Color(0xFF2563EB)
-                                : Colors.grey[400],
+                                : Colors.grey[200]!,
+                            width: isSelected ? 1.5 : 1,
                           ),
-                          const SizedBox(width: 10),
-                          Expanded(
-                            child: Column(
-                              crossAxisAlignment:
-                                  CrossAxisAlignment.start,
-                              children: [
-                                Row(
-                                  children: [
-                                    Flexible(
-                                      child: Text(
-                                        route.summary.isNotEmpty
-                                            ? route.summary
-                                            : 'Route ${ri + 1}',
-                                        style: TextStyle(
-                                          fontWeight: FontWeight.w600,
-                                          fontSize: 13,
-                                          color: isSelected
-                                              ? const Color(0xFF2563EB)
-                                              : Colors.black87,
-                                        ),
-                                      ),
-                                    ),
-                                    if (isBest) ...[
-                                      const SizedBox(width: 6),
-                                      Container(
-                                        padding:
-                                            const EdgeInsets.symmetric(
-                                                horizontal: 5,
-                                                vertical: 1),
-                                        decoration: BoxDecoration(
-                                          color: isSelected
-                                              ? const Color(0xFF2563EB)
-                                              : Colors.grey[300],
-                                          borderRadius:
-                                              BorderRadius.circular(4),
-                                        ),
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: Row(
+                          children: [
+                            Icon(
+                              Icons.route_outlined,
+                              size: 16,
+                              color: isSelected
+                                  ? const Color(0xFF2563EB)
+                                  : Colors.grey[400],
+                            ),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment:
+                                    CrossAxisAlignment.start,
+                                children: [
+                                  Row(
+                                    children: [
+                                      Flexible(
                                         child: Text(
-                                          'BEST',
+                                          route.summary.isNotEmpty
+                                              ? route.summary
+                                              : 'Route ${ri + 1}',
                                           style: TextStyle(
-                                            fontSize: 9,
-                                            fontWeight: FontWeight.w800,
+                                            fontWeight: FontWeight.w600,
+                                            fontSize: 12,
                                             color: isSelected
-                                                ? Colors.white
-                                                : Colors.grey[600],
+                                                ? const Color(0xFF2563EB)
+                                                : Colors.black87,
                                           ),
                                         ),
                                       ),
+                                      if (isBest) ...[
+                                        const SizedBox(width: 6),
+                                        Container(
+                                          padding:
+                                              const EdgeInsets.symmetric(
+                                                  horizontal: 5,
+                                                  vertical: 1),
+                                          decoration: BoxDecoration(
+                                            color: isSelected
+                                                ? const Color(0xFF2563EB)
+                                                : Colors.grey[300],
+                                            borderRadius:
+                                                BorderRadius.circular(4),
+                                          ),
+                                          child: Text(
+                                            'BEST',
+                                            style: TextStyle(
+                                              fontSize: 9,
+                                              fontWeight: FontWeight.w800,
+                                              color: isSelected
+                                                  ? Colors.white
+                                                  : Colors.grey[600],
+                                            ),
+                                          ),
+                                        ),
+                                      ],
                                     ],
-                                  ],
-                                ),
-                                const SizedBox(height: 2),
-                                Text(
-                                  '~${route.durationMinutes} min'
-                                  '${route.distanceKm > 0 ? ' · ${route.distanceKm.toStringAsFixed(1)} km' : ''}',
-                                  style: TextStyle(
-                                      color: Colors.grey[500],
-                                      fontSize: 11),
-                                ),
-                              ],
+                                  ),
+                                  Text(
+                                    '~${route.durationMinutes} min'
+                                    '${route.distanceKm > 0 ? ' · ${route.distanceKm.toStringAsFixed(1)} km' : ''}',
+                                    style: TextStyle(
+                                        color: Colors.grey[500],
+                                        fontSize: 11),
+                                  ),
+                                ],
+                              ),
                             ),
-                          ),
-                          if (isSelected)
-                            const Icon(Icons.check_circle_rounded,
-                                color: Color(0xFF2563EB), size: 18),
-                        ],
+                            if (isSelected)
+                              const Icon(Icons.check_circle_rounded,
+                                  color: Color(0xFF2563EB), size: 16),
+                          ],
+                        ),
                       ),
-                    ),
-                  );
-                }),
-              ],
-            ],
+                    );
+                  }),
+                ],
+              ),
+            ),
+          _dots(),
+        ],
+      ),
+    );
+  }
+
+  Widget _dots() => Column(
+        children: List.generate(
+          3,
+          (_) => Container(
+            margin: const EdgeInsets.symmetric(vertical: 2),
+            width: 2,
+            height: 6,
+            decoration: BoxDecoration(
+              color: Colors.grey[300],
+              borderRadius: BorderRadius.circular(1),
+            ),
+          ),
+        ),
+      );
+}
+
+// ─── Time chip ────────────────────────────────────────────────────────────────
+
+class _TimeChip extends StatelessWidget {
+  final String label;
+  final TimeOfDay time;
+  final Color color;
+  final VoidCallback onTap;
+
+  const _TimeChip({
+    required this.label,
+    required this.time,
+    required this.color,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+        decoration: BoxDecoration(
+          color: color.withValues(alpha: 0.08),
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(color: color.withValues(alpha: 0.3)),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              label == 'Arrive'
+                  ? Icons.login_rounded
+                  : Icons.logout_rounded,
+              size: 12,
+              color: color,
+            ),
+            const SizedBox(width: 5),
+            Text(
+              '$label \u00b7 ${time.format(context)}',
+              style: TextStyle(
+                  fontSize: 11,
+                  color: color,
+                  fontWeight: FontWeight.w600),
+            ),
           ],
         ),
       ),
@@ -920,15 +1306,11 @@ class _TripCard extends StatelessWidget {
 // ─── Location button ──────────────────────────────────────────────────────────
 
 class _LocationButton extends StatelessWidget {
-  final IconData icon;
-  final Color iconColor;
   final String label;
   final bool isEmpty;
   final VoidCallback onTap;
 
   const _LocationButton({
-    required this.icon,
-    required this.iconColor,
     required this.label,
     required this.isEmpty,
     required this.onTap,
@@ -939,8 +1321,7 @@ class _LocationButton extends StatelessWidget {
     return GestureDetector(
       onTap: onTap,
       child: Container(
-        padding:
-            const EdgeInsets.symmetric(horizontal: 12, vertical: 11),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
         decoration: BoxDecoration(
           color: isEmpty ? Colors.grey[50] : Colors.white,
           border: Border.all(
@@ -950,14 +1331,11 @@ class _LocationButton extends StatelessWidget {
         ),
         child: Row(
           children: [
-            Icon(icon, size: 14, color: iconColor),
-            const SizedBox(width: 10),
             Expanded(
               child: Text(
                 label,
                 style: TextStyle(
-                  color:
-                      isEmpty ? Colors.grey[400] : Colors.black87,
+                  color: isEmpty ? Colors.grey[400] : Colors.black87,
                   fontSize: 13,
                   fontWeight:
                       isEmpty ? FontWeight.normal : FontWeight.w500,
@@ -966,8 +1344,7 @@ class _LocationButton extends StatelessWidget {
                 overflow: TextOverflow.ellipsis,
               ),
             ),
-            Icon(Icons.chevron_right,
-                size: 16, color: Colors.grey[400]),
+            Icon(Icons.chevron_right, size: 16, color: Colors.grey[400]),
           ],
         ),
       ),
@@ -975,14 +1352,13 @@ class _LocationButton extends StatelessWidget {
   }
 }
 
-// ─── Transport dropdown ────────────────────────────────────────────────────────
+// ─── Transport dropdown ───────────────────────────────────────────────────────
 
 class _TransportDropdown extends StatelessWidget {
   final _Transport value;
   final ValueChanged<_Transport> onChanged;
 
-  const _TransportDropdown(
-      {required this.value, required this.onChanged});
+  const _TransportDropdown({required this.value, required this.onChanged});
 
   @override
   Widget build(BuildContext context) {
@@ -1005,13 +1381,11 @@ class _TransportDropdown extends StatelessWidget {
                       mainAxisSize: MainAxisSize.min,
                       children: [
                         Icon(t.icon,
-                            size: 16,
-                            color: const Color(0xFF2563EB)),
+                            size: 16, color: const Color(0xFF2563EB)),
                         const SizedBox(width: 8),
                         Text(t.label,
                             style: const TextStyle(
-                                fontSize: 13,
-                                fontWeight: FontWeight.w500)),
+                                fontSize: 13, fontWeight: FontWeight.w500)),
                       ],
                     ),
                   ))
@@ -1030,8 +1404,7 @@ class _LocationPickerScreen extends StatefulWidget {
   const _LocationPickerScreen({required this.initialPosition});
 
   @override
-  State<_LocationPickerScreen> createState() =>
-      _LocationPickerScreenState();
+  State<_LocationPickerScreen> createState() => _LocationPickerScreenState();
 }
 
 class _LocationPickerScreenState extends State<_LocationPickerScreen> {
@@ -1105,7 +1478,6 @@ class _LocationPickerScreenState extends State<_LocationPickerScreen> {
     return Scaffold(
       body: Stack(
         children: [
-          // Map
           GoogleMap(
             onMapCreated: (c) => _ctrl = c,
             initialCameraPosition:
@@ -1115,8 +1487,6 @@ class _LocationPickerScreenState extends State<_LocationPickerScreen> {
             myLocationButtonEnabled: false,
             zoomControlsEnabled: false,
           ),
-
-          // Crosshair
           const Center(
             child: Icon(
               Icons.add,
@@ -1125,8 +1495,6 @@ class _LocationPickerScreenState extends State<_LocationPickerScreen> {
               shadows: [Shadow(blurRadius: 8, color: Colors.white)],
             ),
           ),
-
-          // Top bar
           SafeArea(
             child: Padding(
               padding:
@@ -1179,8 +1547,6 @@ class _LocationPickerScreenState extends State<_LocationPickerScreen> {
               ),
             ),
           ),
-
-          // My location button
           Positioned(
             bottom: 120,
             right: 16,
@@ -1203,8 +1569,6 @@ class _LocationPickerScreenState extends State<_LocationPickerScreen> {
                   color: Color(0xFF2563EB), size: 18),
             ),
           ),
-
-          // Confirm button
           Positioned(
             bottom: 36,
             left: 32,
@@ -1229,7 +1593,7 @@ class _LocationPickerScreenState extends State<_LocationPickerScreen> {
   }
 }
 
-// ─── Step indicator ────────────────────────────────────────────────────────────
+// ─── Step indicator ───────────────────────────────────────────────────────────
 
 class _StepIndicator extends StatelessWidget {
   final int currentStep;
@@ -1264,4 +1628,3 @@ class _StepIndicator extends StatelessWidget {
     );
   }
 }
-
