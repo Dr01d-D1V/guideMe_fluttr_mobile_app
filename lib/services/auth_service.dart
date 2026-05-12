@@ -3,9 +3,11 @@ import 'package:http/http.dart' as http;
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:google_sign_in/google_sign_in.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'api_client.dart';
 
 class AuthService {
-  static const String baseUrl = 'http://10.0.2.2:8000';
+  // static const String baseUrl = 'http://192.168.100.35:8000';
+  static const String baseUrl = 'http://192.168.18.8:8000';
 
   // Lazily instantiated so Google Play Services IPC is deferred until
   // the user actually taps "Continue with Google".
@@ -18,19 +20,13 @@ class AuthService {
       );
 
   // ─── Session helpers ────────────────────────────────────────
-  Future<void> _saveSession(Map<String, dynamic> user, {String? accessToken}) async {
+  Future<void> _saveSession(Map<String, dynamic> user) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool('isLoggedIn', true);
     await prefs.setString('user', jsonEncode(user));
-    if (accessToken != null) {
-      await prefs.setString('accessToken', accessToken);
-    }
   }
 
-  static Future<String?> getAccessToken() async {
-    final prefs = await SharedPreferences.getInstance();
-    return prefs.getString('accessToken');
-  }
+  static Future<String?> getAccessToken() => ApiClient.getAccessToken();
 
   static Future<bool> isLoggedIn() async {
     final prefs = await SharedPreferences.getInstance();
@@ -48,7 +44,7 @@ class AuthService {
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove('isLoggedIn');
     await prefs.remove('user');
-    await prefs.remove('accessToken');
+    await ApiClient.clearSession();
     try {
       await _googleSignIn.signOut();
     } catch (_) {}
@@ -86,10 +82,8 @@ class AuthService {
       final data = jsonDecode(response.body);
 
       if (response.statusCode == 200 && data['status'] == 'OK') {
-        await _saveSession(
-          data['user'] ?? {},
-          accessToken: data['accessToken'] as String?,
-        );
+        await _saveSession(data['user'] ?? {});
+        await ApiClient.saveSession(response);
         return AuthResponse(success: true, user: data['user']);
       } else if (data['status'] == 'FIELD_ERROR') {
         final errors = <String, String>{};
@@ -128,10 +122,8 @@ class AuthService {
       final data = jsonDecode(response.body);
 
       if (response.statusCode == 200 && data['status'] == 'OK') {
-        await _saveSession(
-          data['user'] ?? {},
-          accessToken: data['accessToken'] as String?,
-        );
+        await _saveSession(data['user'] ?? {});
+        await ApiClient.saveSession(response);
         return AuthResponse(success: true, user: data['user']);
       } else if (data['status'] == 'FIELD_ERROR') {
         final errors = <String, String>{};
@@ -194,10 +186,8 @@ class AuthService {
       final data = jsonDecode(response.body);
 
       if (response.statusCode == 200 && data['status'] == 'OK') {
-        await _saveSession(
-          data['user'] ?? {},
-          accessToken: data['accessToken'] as String?,
-        );
+        await _saveSession(data['user'] ?? {});
+        await ApiClient.saveSession(response);
         return AuthResponse(
           success: true,
           user: data['user'],
@@ -269,10 +259,8 @@ class AuthService {
       final data = jsonDecode(response.body);
 
       if (response.statusCode == 200 && data['status'] == 'OK') {
-        await _saveSession(
-          data['user'] ?? {},
-          accessToken: data['accessToken'] as String?,
-        );
+        await _saveSession(data['user'] ?? {});
+        await ApiClient.saveSession(response);
         return AuthResponse(
           success: true,
           user: data['user'],
@@ -334,6 +322,29 @@ class AuthService {
 
   /// The user copies the code from their email and submits it here.
   /// Hits POST /auth/verify-email-token?token=<code>
+  static Future<AuthResponse> resendVerificationEmail({
+    required String email,
+  }) async {
+    try {
+      final response = await http.post(
+        Uri.parse('$baseUrl/auth/resend-verification-email'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({'email': email}),
+      );
+      final data = jsonDecode(response.body);
+      if (response.statusCode == 200) {
+        return AuthResponse(success: true);
+      } else {
+        return AuthResponse(
+          success: false,
+          generalError: data['message'] ?? 'Failed to resend verification email.',
+        );
+      }
+    } catch (e) {
+      return AuthResponse(success: false, generalError: 'Network error: $e');
+    }
+  }
+
   static Future<AuthResponse> verifyEmailToken({
     required String token,
   }) async {
@@ -349,7 +360,7 @@ class AuthService {
       final data = jsonDecode(response.body);
 
       if (response.statusCode == 200) {
-        // Backend returns 200 for success (with any body shape)
+        await ApiClient.saveSession(response);
         return AuthResponse(success: true);
       } else {
         return AuthResponse(

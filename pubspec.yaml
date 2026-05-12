@@ -19,6 +19,9 @@ dependencies:
   geolocator: ^11.0.0
   permission_handler: ^11.3.0
   google_maps_flutter: ^2.6.0
+  flutter_secure_storage: ^9.0.0
+  path_provider: ^2.1.0
+  # supertokens_flutter: ^0.5.0
 
 dev_dependencies:
   flutter_test:

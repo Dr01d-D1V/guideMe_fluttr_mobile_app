@@ -1,15 +1,15 @@
-import java.util.properties
-
-val localprops = properties().apply{
-    val f = rootProject.file("local.properties")
-    if (f.exists()) load(f.inputStream())
-}
+import java.util.Properties
 
 plugins {
     id("com.android.application")
     id("kotlin-android")
     // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
     id("dev.flutter.flutter-gradle-plugin")
+}
+
+val localProps = Properties().apply {
+    val f = rootProject.file("local.properties")
+    if (f.exists()) load(f.inputStream())
 }
 
 android {

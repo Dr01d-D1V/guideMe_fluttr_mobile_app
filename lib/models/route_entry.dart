@@ -49,15 +49,52 @@ class RouteOption {
   });
 
   factory RouteOption.fromJson(Map<String, dynamic> json) {
+    final encoded = json['polyline'] as String? ?? '';
     return RouteOption(
-      encodedPolyline: json['polyline'] as String? ?? '',
-      points: (json['points'] as List<dynamic>? ?? [])
-          .map((p) => {'lat': (p['lat'] as num).toDouble(), 'lng': (p['lng'] as num).toDouble()})
+      encodedPolyline: encoded,
+      points: _decodePolyline(encoded),
+      // description is a slash-separated road name string, e.g. "Road A/Road B"
+      roadNames: (json['description'] as String? ?? '')
+          .split('/')
+          .map((s) => s.trim())
+          .where((s) => s.isNotEmpty)
           .toList(),
-      roadNames: (json['road_names'] as List<dynamic>? ?? []).cast<String>(),
-      durationMinutes: (json['duration_minutes'] as num?)?.toInt() ?? 0,
-      summary: json['summary'] as String? ?? '',
-      distanceKm: (json['distance_km'] as num?)?.toDouble() ?? 0.0,
+      // backend returns duration_seconds; convert to minutes
+      durationMinutes:
+          (((json['duration_seconds'] as num?) ?? 0) / 60).round(),
+      summary: json['description'] as String? ?? '',
+      // backend returns distance_meters; convert to km
+      distanceKm:
+          ((json['distance_meters'] as num?)?.toDouble() ?? 0.0) / 1000.0,
     );
   }
+}
+
+/// Decodes a Google-encoded polyline string into a list of lat/lng points.
+List<Map<String, double>> _decodePolyline(String encoded) {
+  final points = <Map<String, double>>[];
+  int index = 0;
+  int lat = 0;
+  int lng = 0;
+
+  while (index < encoded.length) {
+    int shift = 0, result = 0, b;
+    do {
+      b = encoded.codeUnitAt(index++) - 63;
+      result |= (b & 0x1f) << shift;
+      shift += 5;
+    } while (b >= 0x20);
+    lat += (result & 1) != 0 ? ~(result >> 1) : (result >> 1);
+
+    shift = 0; result = 0;
+    do {
+      b = encoded.codeUnitAt(index++) - 63;
+      result |= (b & 0x1f) << shift;
+      shift += 5;
+    } while (b >= 0x20);
+    lng += (result & 1) != 0 ? ~(result >> 1) : (result >> 1);
+
+    points.add({'lat': lat / 1e5, 'lng': lng / 1e5});
+  }
+  return points;
 }

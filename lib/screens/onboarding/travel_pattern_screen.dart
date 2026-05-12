@@ -1,8 +1,12 @@
+import 'dart:convert';
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
+import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:geolocator/geolocator.dart';
+import 'package:http/http.dart' as http;
 import '../../models/destination.dart';
 import '../../models/route_entry.dart';
 import '../../providers/onboarding_provider.dart';
@@ -23,6 +27,9 @@ enum _Transport {
   final IconData icon;
   final String label;
 }
+
+// Action presented when the user taps an already-set location button.
+enum _LocationChoice { rename, change }
 
 // ─── Stop entry ───────────────────────────────────────────────────────────────
 // Each stop has a location, optional arrive time, and optional depart time.
@@ -69,7 +76,12 @@ class _TripEntry {
       c.label = s.label;
       return c;
     }).toList();
-    segmentRoutes = src.segmentRoutes.map((_) => _SegmentRoutes()).toList();
+    segmentRoutes = src.segmentRoutes.map((sr) {
+      final copy = _SegmentRoutes();
+      copy.routes = List.from(sr.routes);
+      copy.selectedIndex = sr.selectedIndex;
+      return copy;
+    }).toList();
   }
 
   int get segmentCount => stops.length - 1;
@@ -88,7 +100,8 @@ class TravelPatternScreen extends ConsumerStatefulWidget {
       _TravelPatternScreenState();
 }
 
-class _TravelPatternScreenState extends ConsumerState<TravelPatternScreen> {
+class _TravelPatternScreenState extends ConsumerState<TravelPatternScreen>
+    with TickerProviderStateMixin {
   static const _dayNames = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
   static const _dayFull = [
     'Monday', 'Tuesday', 'Wednesday', 'Thursday',
@@ -99,37 +112,87 @@ class _TravelPatternScreenState extends ConsumerState<TravelPatternScreen> {
     'friday', 'saturday', 'sunday'
   ];
 
+  // Per-trip polyline colour palette (index 0 is reserved for the active trip).
+  static const _tripPalette = [
+    Color(0xFFEA580C), // orange
+    Color(0xFF7C3AED), // purple
+    Color(0xFF059669), // emerald
+    Color(0xFFDB2777), // pink
+    Color(0xFF0891B2), // cyan
+    Color(0xFFD97706), // amber
+  ];
+
   int _selectedDay = 0;
+  int? _activeTripIdx;
   final Map<int, List<_TripEntry>> _tripsByDay = {
     for (int i = 0; i < 7; i++) i: [],
   };
+
+  // Panel split fraction (0.12 = collapsed, 0.55 = default, 0.92 = expanded)
+  double _panelFraction = 0.55;
+  late final AnimationController _snapController;
+  late Animation<double> _snapAnimation;
+  final ScrollController _listScrollController = ScrollController();
 
   GoogleMapController? _mapController;
   LatLng _mapCenter = const LatLng(9.0579, 7.4951);
   Set<Marker> _markers = {};
   Set<Polyline> _polylines = {};
   bool _isSubmitting = false;
+  bool _locationPermGranted = false;
 
   @override
   void initState() {
     super.initState();
+    _snapController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 250),
+    );
+    // Keep _panelFraction in sync during snap animations
+    _snapController.addListener(() {
+      if (mounted) setState(() => _panelFraction = _snapAnimation.value);
+    });
+    _snapAnimation = Tween<double>(begin: 0.55, end: 0.55)
+        .animate(_snapController);
     _loadCurrentLocation();
   }
 
   @override
   void dispose() {
     _mapController?.dispose();
+    _snapController.dispose();
+    _listScrollController.dispose();
     super.dispose();
+  }
+
+  void _animatePanelTo(double target) {
+    _snapAnimation = Tween<double>(
+      begin: _panelFraction,
+      end: target,
+    ).animate(
+      CurvedAnimation(parent: _snapController, curve: Curves.easeOut),
+    );
+    _snapController.forward(from: 0);
   }
 
   Future<void> _loadCurrentLocation() async {
     try {
-      final pos = await Geolocator.getCurrentPosition(
-        desiredAccuracy: LocationAccuracy.medium,
-      );
-      if (mounted) {
-        setState(() => _mapCenter = LatLng(pos.latitude, pos.longitude));
-        _mapController?.animateCamera(CameraUpdate.newLatLng(_mapCenter));
+      var status = await Geolocator.checkPermission();
+      if (status == LocationPermission.denied) {
+        status = await Geolocator.requestPermission();
+      }
+      final granted = status == LocationPermission.always ||
+          status == LocationPermission.whileInUse;
+      if (mounted) setState(() => _locationPermGranted = granted);
+
+      if (granted) {
+        final pos = await Geolocator.getCurrentPosition(
+          desiredAccuracy: LocationAccuracy.medium,
+        );
+        if (mounted) {
+          setState(() => _mapCenter = LatLng(pos.latitude, pos.longitude));
+          _mapController?.animateCamera(CameraUpdate.newLatLng(_mapCenter));
+        }
       }
     } catch (_) {}
   }
@@ -183,27 +246,40 @@ class _TravelPatternScreenState extends ConsumerState<TravelPatternScreen> {
         if (sr.routes.isNotEmpty && sr.selectedIndex < sr.routes.length) {
           final route = sr.routes[sr.selectedIndex];
           if (route.points.isNotEmpty) {
+            // Each trip always gets its own palette colour.
+            // When a specific trip is tapped, it gets the blue active colour
+            // and others are dimmed; when nothing is selected every trip is
+            // shown at full opacity in its own colour.
+            final hasSelection = _activeTripIdx != null;
+            final isSelected = _activeTripIdx == t;
+            final paletteColor = _tripPalette[t % _tripPalette.length];
+            final Color lineColor;
+            final int lineWidth;
+            final int lineZIndex;
+            if (!hasSelection) {
+              lineColor = paletteColor;
+              lineWidth = 4;
+              lineZIndex = 0;
+            } else if (isSelected) {
+              lineColor = const Color(0xFF2563EB);
+              lineWidth = 5;
+              lineZIndex = 1;
+            } else {
+              lineColor = paletteColor.withValues(alpha: 0.40);
+              lineWidth = 3;
+              lineZIndex = 0;
+            }
             polylines.add(Polyline(
               polylineId: PolylineId('seg_${_selectedDay}_${t}_$seg'),
-              color: const Color(0xFF2563EB),
-              width: 4,
+              color: lineColor,
+              width: lineWidth,
               points: route.points
                   .map((p) => LatLng(p['lat'] ?? 0.0, p['lng'] ?? 0.0))
                   .toList(),
+              zIndex: lineZIndex,
             ));
-            continue;
           }
         }
-        polylines.add(Polyline(
-          polylineId: PolylineId('seg_${_selectedDay}_${t}_$seg'),
-          color: const Color(0xFF2563EB),
-          width: 3,
-          patterns: [PatternItem.dash(12), PatternItem.gap(8)],
-          points: [
-            LatLng(fromStop.location!.lat, fromStop.location!.lng),
-            LatLng(toStop.location!.lat, toStop.location!.lng),
-          ],
-        ));
       }
     }
 
@@ -241,6 +317,24 @@ class _TravelPatternScreenState extends ConsumerState<TravelPatternScreen> {
           trip.segmentRoutes[segIdx].isLoading = false;
         });
         _refreshMapOverlays();
+        _recalcArrivalTimes(dayIdx, tripIdx);
+        // Fit the camera to the fetched route polyline
+        if (routes.isNotEmpty && routes.first.points.isNotEmpty) {
+          final pts = routes.first.points
+              .map((p) => LatLng(p['lat'] ?? 0.0, p['lng'] ?? 0.0))
+              .toList();
+          final lats = pts.map((p) => p.latitude);
+          final lngs = pts.map((p) => p.longitude);
+          final bounds = LatLngBounds(
+            southwest: LatLng(lats.reduce((a, b) => a < b ? a : b),
+                lngs.reduce((a, b) => a < b ? a : b)),
+            northeast: LatLng(lats.reduce((a, b) => a > b ? a : b),
+                lngs.reduce((a, b) => a > b ? a : b)),
+          );
+          _mapController?.animateCamera(
+            CameraUpdate.newLatLngBounds(bounds, 60),
+          );
+        }
       }
     } catch (e) {
       if (mounted) {
@@ -252,18 +346,153 @@ class _TravelPatternScreenState extends ConsumerState<TravelPatternScreen> {
     }
   }
 
+  // ─── Auto-calculate arrival times ─────────────────────────────────────────
+  //
+  // For each segment in a trip, arrival time at stop[seg+1] =
+  // stop[seg].departTime + selectedRoute.durationMinutes.
+
+  void _recalcArrivalTimes(int dayIdx, int tripIdx) {
+    final trip = _tripsByDay[dayIdx]?[tripIdx];
+    if (trip == null) return;
+    for (int seg = 0; seg < trip.segmentCount; seg++) {
+      final departTime = trip.stops[seg].departTime;
+      if (departTime == null) continue;
+      final durationMins = (seg < trip.segmentRoutes.length &&
+              trip.segmentRoutes[seg].routes.isNotEmpty)
+          ? trip.segmentRoutes[seg]
+              .routes[trip.segmentRoutes[seg].selectedIndex]
+              .durationMinutes
+          : 0;
+      final totalMins =
+          departTime.hour * 60 + departTime.minute + durationMins;
+      setState(() {
+        trip.stops[seg + 1].arriveTime = TimeOfDay(
+          hour: (totalMins ~/ 60) % 24,
+          minute: totalMins % 60,
+        );
+      });
+    }
+  }
+
+  // ─── Rename an existing stop label without re-picking coords ─────────────
+
+  Future<void> _renameLocation(int tripIdx, int stopIdx) async {
+    final stop = _currentTrips[tripIdx].stops[stopIdx];
+    final ctrl = TextEditingController(text: stop.label);
+    final newLabel = await showDialog<String>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text('Rename location'),
+        content: TextField(
+          controller: ctrl,
+          autofocus: true,
+          textCapitalization: TextCapitalization.words,
+          decoration: const InputDecoration(border: OutlineInputBorder()),
+          onSubmitted: (v) {
+            if (v.trim().isNotEmpty) Navigator.pop(context, v.trim());
+          },
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () {
+              final v = ctrl.text.trim();
+              if (v.isNotEmpty) Navigator.pop(context, v);
+            },
+            style: FilledButton.styleFrom(
+                backgroundColor: const Color(0xFF2563EB)),
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+    ctrl.dispose();
+    if (newLabel != null && mounted) {
+      setState(() =>
+          _tripsByDay[_selectedDay]![tripIdx].stops[stopIdx].label = newLabel);
+    }
+  }
+
   // ─── Location picker ──────────────────────────────────────────────────────
 
   Future<void> _pickLocation(int tripIdx, int stopIdx) async {
     final stop = _currentTrips[tripIdx].stops[stopIdx];
+
+    // Already has a location — offer rename or change
+    if (stop.location != null) {
+      final choice = await showModalBottomSheet<_LocationChoice>(
+        context: context,
+        shape: const RoundedRectangleBorder(
+            borderRadius:
+                BorderRadius.vertical(top: Radius.circular(16))),
+        builder: (_) => SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                margin: const EdgeInsets.symmetric(vertical: 10),
+                width: 36,
+                height: 4,
+                decoration: BoxDecoration(
+                    color: Colors.grey[300],
+                    borderRadius: BorderRadius.circular(2)),
+              ),
+              ListTile(
+                leading: const Icon(Icons.edit_outlined,
+                    color: Color(0xFF2563EB)),
+                title: const Text('Rename label'),
+                subtitle: Text(stop.label,
+                    style: TextStyle(color: Colors.grey[500])),
+                onTap: () =>
+                    Navigator.pop(context, _LocationChoice.rename),
+              ),
+              ListTile(
+                leading: const Icon(Icons.place_outlined,
+                    color: Color(0xFF2563EB)),
+                title: const Text('Change location'),
+                onTap: () =>
+                    Navigator.pop(context, _LocationChoice.change),
+              ),
+              const SizedBox(height: 8),
+            ],
+          ),
+        ),
+      );
+      if (choice == null || !mounted) return;
+      if (choice == _LocationChoice.rename) {
+        await _renameLocation(tripIdx, stopIdx);
+        return;
+      }
+      // _LocationChoice.change falls through to the full picker below
+    }
+
     final initial = stop.location != null
         ? LatLng(stop.location!.lat, stop.location!.lng)
         : _mapCenter;
 
+    // Collect all previously pinned locations across all days (deduplicated).
+    final seen = <String>{};
+    final knownLocations = <LocationResult>[];
+    for (final trips in _tripsByDay.values) {
+      for (final trip in trips) {
+        for (final s in trip.stops) {
+          if (s.location == null) continue;
+          final key = '${s.location!.lat},${s.location!.lng}';
+          if (seen.add(key)) knownLocations.add(s.location!);
+        }
+      }
+    }
+
     final result = await Navigator.of(context).push<LocationResult>(
       MaterialPageRoute(
         fullscreenDialog: true,
-        builder: (_) => _LocationPickerScreen(initialPosition: initial),
+        builder: (_) => _LocationPickerScreen(
+          initialPosition: initial,
+          knownLocations: knownLocations,
+        ),
       ),
     );
 
@@ -307,17 +536,34 @@ class _TravelPatternScreenState extends ConsumerState<TravelPatternScreen> {
 
   // ─── Remove stop ──────────────────────────────────────────────────────────
 
-  void _removeStop(int tripIdx, int stopIdx) {
+  Future<void> _removeStop(int tripIdx, int stopIdx) async {
     final trip = _tripsByDay[_selectedDay]![tripIdx];
     if (trip.stops.length <= 2) return;
+
+    // Middle stop removal: the surviving segment at segIdx will now span
+    // prev→next and has stale route data — it needs to be cleared + re-fetched.
+    final isMiddle = stopIdx > 0 && stopIdx < trip.stops.length - 1;
+    final segIdx = stopIdx > 0 ? stopIdx - 1 : 0;
+
     setState(() {
       trip.stops.removeAt(stopIdx);
-      final segIdx = stopIdx > 0 ? stopIdx - 1 : 0;
       if (segIdx < trip.segmentRoutes.length) {
         trip.segmentRoutes.removeAt(segIdx);
       }
+      // Clear the now-merged segment's stale route data
+      if (isMiddle && segIdx < trip.segmentRoutes.length) {
+        trip.segmentRoutes[segIdx].routes = [];
+        trip.segmentRoutes[segIdx].error = null;
+      }
     });
     _refreshMapOverlays();
+
+    // Re-fetch the merged segment if both endpoints are known
+    if (isMiddle &&
+        segIdx < trip.segmentRoutes.length &&
+        trip.segmentReady(segIdx)) {
+      await _fetchSegment(_selectedDay, tripIdx, segIdx);
+    }
   }
 
   // ─── Time picker ──────────────────────────────────────────────────────────
@@ -336,6 +582,8 @@ class _TravelPatternScreenState extends ConsumerState<TravelPatternScreen> {
         _tripsByDay[_selectedDay]![tripIdx].stops[stopIdx].arriveTime = picked;
       }
     });
+    // After changing departure time, recalculate downstream arrival times.
+    if (isDeparture) _recalcArrivalTimes(_selectedDay, tripIdx);
   }
 
   // ─── Copy day sheet ───────────────────────────────────────────────────────
@@ -579,6 +827,20 @@ class _TravelPatternScreenState extends ConsumerState<TravelPatternScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final screenHeight = MediaQuery.of(context).size.height;
+    // Available body height = screen minus status bar minus AppBar (toolbar 56 + step-indicator 20).
+    // Subtract 8 px so the handle always stays just below the AppBar and is reachable.
+    final bodyHeight = screenHeight
+        - MediaQuery.of(context).padding.top
+        - kToolbarHeight
+        - 20   // step-indicator PreferredSize height
+        - 8;   // guaranteed gap
+    final maxFraction = (bodyHeight / screenHeight).clamp(0.30, 0.95);
+    // Clamp stored fraction on next frame if layout changed.
+    if (_panelFraction > maxFraction) {
+      SchedulerBinding.instance.addPostFrameCallback(
+          (_) { if (mounted) setState(() => _panelFraction = maxFraction); });
+    }
     return Scaffold(
       appBar: AppBar(
         title: const Text('Set Your Trips'),
@@ -598,224 +860,310 @@ class _TravelPatternScreenState extends ConsumerState<TravelPatternScreen> {
           child: _StepIndicator(currentStep: 0, totalSteps: 2),
         ),
       ),
-      body: Column(
+      body: Stack(
         children: [
-          // ── Map preview ────────────────────────────────────────────────
-          SizedBox(
-            height: MediaQuery.of(context).size.height * 0.30,
-            child: Stack(
-              children: [
-                GoogleMap(
-                  onMapCreated: (c) {
-                    _mapController = c;
-                    _mapController!
-                        .animateCamera(CameraUpdate.newLatLng(_mapCenter));
-                  },
-                  initialCameraPosition:
-                      CameraPosition(target: _mapCenter, zoom: 13),
-                  markers: _markers,
-                  polylines: _polylines,
-                  myLocationEnabled: true,
-                  myLocationButtonEnabled: false,
-                  zoomControlsEnabled: false,
-                ),
-                Positioned(
-                  bottom: 12,
-                  right: 12,
-                  child: FloatingActionButton.small(
-                    heroTag: 'map_location',
-                    backgroundColor: Colors.white,
-                    onPressed: () async {
-                      try {
-                        final pos =
-                            await Geolocator.getCurrentPosition(
-                          desiredAccuracy: LocationAccuracy.medium,
-                        );
-                        _mapController?.animateCamera(
-                          CameraUpdate.newLatLngZoom(
-                            LatLng(pos.latitude, pos.longitude), 14),
-                        );
-                      } catch (_) {}
-                    },
-                    child: const Icon(Icons.my_location,
-                        color: Color(0xFF2563EB), size: 18),
-                  ),
-                ),
-              ],
+          // ── Full-screen map ────────────────────────────────────────────
+          Positioned.fill(
+            child: GoogleMap(
+              onMapCreated: (c) {
+                _mapController = c;
+                _mapController!
+                    .animateCamera(CameraUpdate.newLatLng(_mapCenter));
+              },
+              initialCameraPosition:
+                  CameraPosition(target: _mapCenter, zoom: 13),
+              markers: _markers,
+              polylines: _polylines,
+              myLocationEnabled: _locationPermGranted,
+              myLocationButtonEnabled: false,
+              zoomControlsEnabled: false,
             ),
           ),
-
-          // ── Day selector ───────────────────────────────────────────────
-          Container(
-            color: Colors.white,
-            padding: const EdgeInsets.symmetric(vertical: 10),
-            child: SingleChildScrollView(
-              scrollDirection: Axis.horizontal,
-              padding: const EdgeInsets.symmetric(horizontal: 16),
-              child: Row(
-                children: List.generate(7, (i) {
-                  final isSelected = _selectedDay == i;
-                  final hasTrips = _tripsByDay[i]!.isNotEmpty;
-                  return GestureDetector(
-                    onTap: () {
-                      setState(() => _selectedDay = i);
-                      _refreshMapOverlays();
+          // ── My-location FAB (floats above panel) ──────────────────────
+          Positioned(
+            bottom: screenHeight * _panelFraction + 8,
+            right: 12,
+            child: FloatingActionButton.small(
+              heroTag: 'map_location',
+              backgroundColor: Colors.white,
+              onPressed: () async {
+                try {
+                  final pos = await Geolocator.getCurrentPosition(
+                    desiredAccuracy: LocationAccuracy.medium,
+                  );
+                  _mapController?.animateCamera(
+                    CameraUpdate.newLatLngZoom(
+                        LatLng(pos.latitude, pos.longitude), 14),
+                  );
+                } catch (_) {}
+              },
+              child: const Icon(Icons.my_location,
+                  color: Color(0xFF2563EB), size: 18),
+            ),
+          ),
+          // ── Custom trip panel (handle-only resize) ────────────────────
+          Positioned(
+            left: 0,
+            right: 0,
+            bottom: 0,
+            height: screenHeight * _panelFraction,
+            child: Container(
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: const BorderRadius.vertical(
+                    top: Radius.circular(20)),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withValues(alpha: 0.12),
+                    blurRadius: 12,
+                    offset: const Offset(0, -2),
+                  ),
+                ],
+              ),
+              child: Column(
+                children: [
+                  // Handle — ONLY this area resizes the panel
+                  GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onVerticalDragUpdate: (details) {
+                      final delta = -details.delta.dy / screenHeight;
+                      setState(() {
+                        _panelFraction =
+                            (_panelFraction + delta).clamp(0.12, maxFraction);
+                      });
                     },
-                    child: AnimatedContainer(
-                      duration: const Duration(milliseconds: 180),
-                      margin: const EdgeInsets.only(right: 8),
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 18, vertical: 8),
-                      decoration: BoxDecoration(
-                        color: isSelected
-                            ? const Color(0xFF2563EB)
-                            : Colors.grey[100],
-                        borderRadius: BorderRadius.circular(20),
-                        border: Border.all(
-                          color: isSelected
-                              ? const Color(0xFF2563EB)
-                              : Colors.grey[300]!,
+                    onVerticalDragEnd: (details) {
+                      final snapSizes = [0.12, 0.55, maxFraction];
+                      final nearest = snapSizes.reduce((a, b) =>
+                          (a - _panelFraction).abs() <
+                                  (b - _panelFraction).abs()
+                              ? a
+                              : b);
+                      _animatePanelTo(nearest);
+                    },
+                    child: Center(
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 10),
+                        child: Container(
+                          width: 36,
+                          height: 4,
+                          decoration: BoxDecoration(
+                            color: Colors.grey[300],
+                            borderRadius: BorderRadius.circular(2),
+                          ),
                         ),
                       ),
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
+                    ),
+                  ),
+                    // Day selector (always visible)
+                    Container(
+                      color: Colors.white,
+                      padding: const EdgeInsets.symmetric(vertical: 6),
+                      child: SingleChildScrollView(
+                        scrollDirection: Axis.horizontal,
+                        padding:
+                            const EdgeInsets.symmetric(horizontal: 16),
+                        child: Row(
+                          children: List.generate(7, (i) {
+                            final isSelected = _selectedDay == i;
+                            final hasTrips = _tripsByDay[i]!.isNotEmpty;
+                            return GestureDetector(
+                              onTap: () {
+                                setState(() => _selectedDay = i);
+                                _refreshMapOverlays();
+                              },
+                              child: AnimatedContainer(
+                                duration:
+                                    const Duration(milliseconds: 180),
+                                margin: const EdgeInsets.only(right: 8),
+                                padding: const EdgeInsets.symmetric(
+                                    horizontal: 18, vertical: 8),
+                                decoration: BoxDecoration(
+                                  color: isSelected
+                                      ? const Color(0xFF2563EB)
+                                      : Colors.grey[100],
+                                  borderRadius: BorderRadius.circular(20),
+                                  border: Border.all(
+                                    color: isSelected
+                                        ? const Color(0xFF2563EB)
+                                        : Colors.grey[300]!,
+                                  ),
+                                ),
+                                child: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Text(
+                                      _dayNames[i],
+                                      style: TextStyle(
+                                        color: isSelected
+                                            ? Colors.white
+                                            : Colors.black87,
+                                        fontWeight: FontWeight.w600,
+                                        fontSize: 13,
+                                      ),
+                                    ),
+                                    if (hasTrips) ...[
+                                      const SizedBox(width: 5),
+                                      Container(
+                                        width: 6,
+                                        height: 6,
+                                        decoration: BoxDecoration(
+                                          shape: BoxShape.circle,
+                                          color: isSelected
+                                              ? Colors.white.withValues(
+                                                  alpha: 0.8)
+                                              : const Color(0xFF2563EB),
+                                        ),
+                                      ),
+                                    ],
+                                  ],
+                                ),
+                              ),
+                            );
+                          }),
+                        ),
+                      ),
+                    ),
+                    const Divider(height: 1),
+                    // Trip list (scrollable — independent from sheet drag)
+                    Expanded(
+                      child: ListView(
+                        controller: _listScrollController,
+                        padding: const EdgeInsets.all(16),
                         children: [
-                          Text(
-                            _dayNames[i],
-                            style: TextStyle(
-                              color: isSelected
-                                  ? Colors.white
-                                  : Colors.black87,
-                              fontWeight: FontWeight.w600,
-                              fontSize: 13,
-                            ),
-                          ),
-                          if (hasTrips) ...[
-                            const SizedBox(width: 5),
-                            Container(
-                              width: 6,
-                              height: 6,
-                              decoration: BoxDecoration(
-                                shape: BoxShape.circle,
-                                color: isSelected
-                                    ? Colors.white.withValues(alpha: 0.8)
-                                    : const Color(0xFF2563EB),
+                          if (_currentTrips.isEmpty)
+                            Padding(
+                              padding: const EdgeInsets.symmetric(
+                                  vertical: 24),
+                              child: Column(
+                                children: [
+                                  Icon(Icons.add_road_outlined,
+                                      size: 48,
+                                      color: Colors.grey[300]),
+                                  const SizedBox(height: 12),
+                                  Text(
+                                    'No trips for ${_dayFull[_selectedDay]}',
+                                    style: const TextStyle(
+                                        fontWeight: FontWeight.w600,
+                                        fontSize: 15),
+                                  ),
+                                  const SizedBox(height: 4),
+                                  Text(
+                                    'Tap below to add where you\'ll go and when.',
+                                    textAlign: TextAlign.center,
+                                    style: TextStyle(
+                                        color: Colors.grey[500],
+                                        height: 1.5),
+                                  ),
+                                ],
+                              ),
+                            )
+                          else
+                            ...List.generate(
+                              _currentTrips.length,
+                              (i) => GestureDetector(
+                                behavior: HitTestBehavior.translucent,
+                                onTap: () {
+                                  if (_activeTripIdx != i) {
+                                    setState(() => _activeTripIdx = i);
+                                    _refreshMapOverlays();
+                                  }
+                                },
+                                child: _TripCard(
+                                  key: ValueKey('trip_${_selectedDay}_$i'),
+                                  index: i,
+                                  trip: _currentTrips[i],
+                                  isFirstTrip: i == 0,
+                                  isLastTrip:
+                                      i == _currentTrips.length - 1,
+                                  onPickLocation: (stopIdx) =>
+                                      _pickLocation(i, stopIdx),
+                                  onAddWaypoint: () => _addWaypoint(i),
+                                  onRemoveStop: (stopIdx) =>
+                                      _removeStop(i, stopIdx),
+                                  onPickStopTime: (stopIdx, isDep) =>
+                                      _pickStopTime(i, stopIdx, isDep),
+                                  onTransportChanged: (t) => setState(() =>
+                                      _tripsByDay[_selectedDay]![i]
+                                          .transport = t),
+                                  onSelectRoute: (segIdx, ri) {
+                                    setState(() =>
+                                        _tripsByDay[_selectedDay]![i]
+                                            .segmentRoutes[segIdx]
+                                            .selectedIndex = ri);
+                                    _refreshMapOverlays();
+                                    _recalcArrivalTimes(_selectedDay, i);
+                                  },
+                                  onDelete: () {
+                                    setState(() {
+                                      _tripsByDay[_selectedDay]!
+                                          .removeAt(i);
+                                      if (_activeTripIdx != null) {
+                                        if (_activeTripIdx == i) {
+                                          _activeTripIdx = null;
+                                        } else if (_activeTripIdx! > i) {
+                                          _activeTripIdx =
+                                              _activeTripIdx! - 1;
+                                        }
+                                      }
+                                    });
+                                    _refreshMapOverlays();
+                                  },
+                                  onRetry: (segIdx) =>
+                                      _fetchSegment(_selectedDay, i, segIdx),
+                                  isVeryFirstStop: _isVeryFirstStop,
+                                  isVeryLastStop: _isVeryLastStop,
+                                ),
                               ),
                             ),
-                          ],
+                          const SizedBox(height: 8),
+                          OutlinedButton.icon(
+                            onPressed: () => setState(
+                                () => _currentTrips.add(_TripEntry())),
+                            icon: const Icon(Icons.add),
+                            label: Text(
+                                'Add trip for ${_dayFull[_selectedDay]}'),
+                            style: OutlinedButton.styleFrom(
+                              padding: const EdgeInsets.symmetric(
+                                  vertical: 14),
+                              shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(12)),
+                            ),
+                          ),
+                          const SizedBox(height: 16),
+                          FilledButton(
+                            onPressed: _isSubmitting ? null : _submit,
+                            style: FilledButton.styleFrom(
+                              backgroundColor: const Color(0xFF2563EB),
+                              padding: const EdgeInsets.symmetric(
+                                  vertical: 16),
+                              shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(14)),
+                            ),
+                            child: _isSubmitting
+                                ? const SizedBox(
+                                    height: 20,
+                                    width: 20,
+                                    child: CircularProgressIndicator(
+                                        strokeWidth: 2,
+                                        color: Colors.white),
+                                  )
+                                : const Text('Continue',
+                                    style: TextStyle(
+                                        fontSize: 16,
+                                        fontWeight: FontWeight.w600)),
+                          ),
+                          const SizedBox(height: 24),
                         ],
                       ),
                     ),
-                  );
-                }),
+                  ],
+                ),
               ),
             ),
-          ),
-
-          const Divider(height: 1),
-
-          // ── Trip list ──────────────────────────────────────────────────
-          Expanded(
-            child: ListView(
-              padding: const EdgeInsets.all(16),
-              children: [
-                if (_currentTrips.isEmpty)
-                  Padding(
-                    padding: const EdgeInsets.symmetric(vertical: 24),
-                    child: Column(
-                      children: [
-                        Icon(Icons.add_road_outlined,
-                            size: 48, color: Colors.grey[300]),
-                        const SizedBox(height: 12),
-                        Text(
-                          'No trips for ${_dayFull[_selectedDay]}',
-                          style: const TextStyle(
-                              fontWeight: FontWeight.w600, fontSize: 15),
-                        ),
-                        const SizedBox(height: 4),
-                        Text(
-                          'Tap below to add where you\'ll go and when.',
-                          textAlign: TextAlign.center,
-                          style: TextStyle(
-                              color: Colors.grey[500], height: 1.5),
-                        ),
-                      ],
-                    ),
-                  )
-                else
-                  ...List.generate(
-                    _currentTrips.length,
-                    (i) => _TripCard(
-                      key: ValueKey('trip_${_selectedDay}_$i'),
-                      index: i,
-                      trip: _currentTrips[i],
-                      isFirstTrip: i == 0,
-                      isLastTrip: i == _currentTrips.length - 1,
-                      onPickLocation: (stopIdx) => _pickLocation(i, stopIdx),
-                      onAddWaypoint: () => _addWaypoint(i),
-                      onRemoveStop: (stopIdx) => _removeStop(i, stopIdx),
-                      onPickStopTime: (stopIdx, isDep) =>
-                          _pickStopTime(i, stopIdx, isDep),
-                      onTransportChanged: (t) => setState(
-                          () => _tripsByDay[_selectedDay]![i].transport = t),
-                      onSelectRoute: (segIdx, ri) {
-                        setState(() => _tripsByDay[_selectedDay]![i]
-                            .segmentRoutes[segIdx]
-                            .selectedIndex = ri);
-                        _refreshMapOverlays();
-                      },
-                      onDelete: () {
-                        setState(
-                            () => _tripsByDay[_selectedDay]!.removeAt(i));
-                        _refreshMapOverlays();
-                      },
-                      onRetry: (segIdx) =>
-                          _fetchSegment(_selectedDay, i, segIdx),
-                      isVeryFirstStop: _isVeryFirstStop,
-                      isVeryLastStop: _isVeryLastStop,
-                    ),
-                  ),
-
-                const SizedBox(height: 8),
-                OutlinedButton.icon(
-                  onPressed: () =>
-                      setState(() => _currentTrips.add(_TripEntry())),
-                  icon: const Icon(Icons.add),
-                  label: Text('Add trip for ${_dayFull[_selectedDay]}'),
-                  style: OutlinedButton.styleFrom(
-                    padding: const EdgeInsets.symmetric(vertical: 14),
-                    shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(12)),
-                  ),
-                ),
-
-                const SizedBox(height: 16),
-                FilledButton(
-                  onPressed: _isSubmitting ? null : _submit,
-                  style: FilledButton.styleFrom(
-                    backgroundColor: const Color(0xFF2563EB),
-                    padding: const EdgeInsets.symmetric(vertical: 16),
-                    shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(14)),
-                  ),
-                  child: _isSubmitting
-                      ? const SizedBox(
-                          height: 20,
-                          width: 20,
-                          child: CircularProgressIndicator(
-                              strokeWidth: 2, color: Colors.white),
-                        )
-                      : const Text('Continue',
-                          style: TextStyle(
-                              fontSize: 16, fontWeight: FontWeight.w600)),
-                ),
-                const SizedBox(height: 24),
-              ],
-            ),
-          ),
-        ],
-      ),
-    );
+          ],
+        ),   // Stack
+    );       // Scaffold
   }
 }
 
@@ -945,7 +1293,7 @@ class _TripCard extends StatelessWidget {
                         label: 'Arrive',
                         time: stop.arriveTime!,
                         color: const Color(0xFFEF4444),
-                        onTap: () => onPickStopTime(si, false),
+                        // Arrival time is auto-calculated — read-only (no onTap)
                       ),
                     ),
 
@@ -1258,45 +1606,52 @@ class _TimeChip extends StatelessWidget {
   final String label;
   final TimeOfDay time;
   final Color color;
-  final VoidCallback onTap;
+  final VoidCallback? onTap;
 
   const _TimeChip({
     required this.label,
     required this.time,
     required this.color,
-    required this.onTap,
+    this.onTap,
   });
 
   @override
   Widget build(BuildContext context) {
+    final readOnly = onTap == null;
     return GestureDetector(
       onTap: onTap,
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-        decoration: BoxDecoration(
-          color: color.withValues(alpha: 0.08),
-          borderRadius: BorderRadius.circular(20),
-          border: Border.all(color: color.withValues(alpha: 0.3)),
-        ),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(
-              label == 'Arrive'
-                  ? Icons.login_rounded
-                  : Icons.logout_rounded,
-              size: 12,
-              color: color,
-            ),
-            const SizedBox(width: 5),
-            Text(
-              '$label \u00b7 ${time.format(context)}',
-              style: TextStyle(
-                  fontSize: 11,
-                  color: color,
-                  fontWeight: FontWeight.w600),
-            ),
-          ],
+      child: Opacity(
+        opacity: readOnly ? 0.75 : 1.0,
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+          decoration: BoxDecoration(
+            color: color.withValues(alpha: 0.08),
+            borderRadius: BorderRadius.circular(20),
+            border: Border.all(color: color.withValues(alpha: 0.3)),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                readOnly
+                    ? Icons.access_time_rounded
+                    : label == 'Arrive'
+                        ? Icons.login_rounded
+                        : Icons.logout_rounded,
+                size: 12,
+                color: color,
+              ),
+              const SizedBox(width: 5),
+              Text(
+                '$label \u00b7 ${time.format(context)}',
+                style: TextStyle(
+                    fontSize: 11,
+                    color: color,
+                    fontWeight: FontWeight.w600),
+              ),
+              if (readOnly) ...[const SizedBox(width: 4), Icon(Icons.lock_outline_rounded, size: 9, color: color)],
+            ],
+          ),
         ),
       ),
     );
@@ -1401,21 +1756,39 @@ class _TransportDropdown extends StatelessWidget {
 
 class _LocationPickerScreen extends StatefulWidget {
   final LatLng initialPosition;
-  const _LocationPickerScreen({required this.initialPosition});
+  final List<LocationResult> knownLocations;
+  const _LocationPickerScreen({
+    required this.initialPosition,
+    this.knownLocations = const [],
+  });
 
   @override
   State<_LocationPickerScreen> createState() => _LocationPickerScreenState();
 }
 
 class _LocationPickerScreenState extends State<_LocationPickerScreen> {
-  late LatLng _center;
   GoogleMapController? _ctrl;
   final _labelCtrl = TextEditingController();
+  LatLng? _tappedLocation;
+  bool _locationPermGranted = false;
+  String? _suggestedName;
 
   @override
   void initState() {
     super.initState();
-    _center = widget.initialPosition;
+    _checkLocationPermission();
+  }
+
+  Future<void> _checkLocationPermission() async {
+    var status = await Geolocator.checkPermission();
+    if (status == LocationPermission.denied) {
+      status = await Geolocator.requestPermission();
+    }
+    if (!mounted) return;
+    setState(() {
+      _locationPermGranted = status == LocationPermission.always ||
+          status == LocationPermission.whileInUse;
+    });
   }
 
   @override
@@ -1425,8 +1798,69 @@ class _LocationPickerScreenState extends State<_LocationPickerScreen> {
     super.dispose();
   }
 
+  Future<void> _onLongPress(LatLng latLng) async {
+    setState(() {
+      _tappedLocation = latLng;
+      _suggestedName = null;
+    });
+    // Reverse-geocode to pre-fill the label dialog with the place name
+    final name = await _reverseGeocode(latLng);
+    if (name != null && mounted) setState(() => _suggestedName = name);
+  }
+
+  /// Calls Google Geocoding API with the existing Maps API key — no backend needed.
+  /// First tries to get a named establishment (business/landmark), then falls
+  /// back to the formatted address so we always get a human-readable name.
+  Future<String?> _reverseGeocode(LatLng pos) async {
+    try {
+      final key = dotenv.env['GOOGLE_MAPS_API_KEY'] ?? '';
+      if (key.isEmpty) return null;
+
+      // 1) Try establishment / point_of_interest first for POI names.
+      final estResp = await http.get(Uri.parse(
+        'https://maps.googleapis.com/maps/api/geocode/json'
+        '?latlng=${pos.latitude},${pos.longitude}'
+        '&result_type=establishment%7Cpoint_of_interest&key=$key',
+      ));
+      final estData = jsonDecode(estResp.body) as Map<String, dynamic>;
+      if (estData['status'] == 'OK') {
+        final results = estData['results'] as List?;
+        if (results != null && results.isNotEmpty) {
+          final first = results.first as Map;
+          // Extract the establishment name from address_components or formatted_address.
+          final comps = first['address_components'] as List? ?? [];
+          for (final c in comps) {
+            final types = (c['types'] as List? ?? []).cast<String>();
+            if (types.contains('establishment') ||
+                types.contains('point_of_interest')) {
+              return c['long_name'] as String?;
+            }
+          }
+          // Fallback within the result: use the first part before a comma.
+          final addr = first['formatted_address'] as String? ?? '';
+          if (addr.isNotEmpty) return addr.split(',').first.trim();
+        }
+      }
+
+      // 2) Regular geocode fallback.
+      final response = await http.get(Uri.parse(
+        'https://maps.googleapis.com/maps/api/geocode/json'
+        '?latlng=${pos.latitude},${pos.longitude}&key=$key',
+      ));
+      final data = jsonDecode(response.body) as Map<String, dynamic>;
+      if (data['status'] == 'OK') {
+        final results = data['results'] as List?;
+        if (results != null && results.isNotEmpty) {
+          return (results.first as Map)['formatted_address'] as String?;
+        }
+      }
+    } catch (_) {}
+    return null;
+  }
+
   Future<void> _confirm() async {
-    _labelCtrl.clear();
+    if (_tappedLocation == null) return;
+    _labelCtrl.text = _suggestedName ?? '';
     final label = await showDialog<String>(
       context: context,
       builder: (_) => AlertDialog(
@@ -1466,8 +1900,8 @@ class _LocationPickerScreenState extends State<_LocationPickerScreen> {
         context,
         LocationResult(
           address: label,
-          lat: _center.latitude,
-          lng: _center.longitude,
+          lat: _tappedLocation!.latitude,
+          lng: _tappedLocation!.longitude,
         ),
       );
     }
@@ -1475,6 +1909,16 @@ class _LocationPickerScreenState extends State<_LocationPickerScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final marker = _tappedLocation == null
+        ? <Marker>{}
+        : {
+            Marker(
+              markerId: const MarkerId('selected'),
+              position: _tappedLocation!,
+              infoWindow: const InfoWindow(title: 'Selected location'),
+            ),
+          };
+
     return Scaffold(
       body: Stack(
         children: [
@@ -1482,67 +1926,125 @@ class _LocationPickerScreenState extends State<_LocationPickerScreen> {
             onMapCreated: (c) => _ctrl = c,
             initialCameraPosition:
                 CameraPosition(target: widget.initialPosition, zoom: 15),
-            onCameraMove: (pos) => _center = pos.target,
-            myLocationEnabled: true,
+            onLongPress: _onLongPress,
+            markers: marker,
+            myLocationEnabled: _locationPermGranted,
             myLocationButtonEnabled: false,
             zoomControlsEnabled: false,
-          ),
-          const Center(
-            child: Icon(
-              Icons.add,
-              size: 44,
-              color: Color(0xFF2563EB),
-              shadows: [Shadow(blurRadius: 8, color: Colors.white)],
-            ),
           ),
           SafeArea(
             child: Padding(
               padding:
                   const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-              child: Row(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Material(
-                    color: Colors.white,
-                    shape: const CircleBorder(),
-                    elevation: 2,
-                    child: InkWell(
-                      customBorder: const CircleBorder(),
-                      onTap: () => Navigator.pop(context),
-                      child: const Padding(
-                        padding: EdgeInsets.all(10),
-                        child: Icon(Icons.arrow_back, size: 20),
-                      ),
-                    ),
-                  ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 14, vertical: 10),
-                      decoration: BoxDecoration(
+                  // Back button + hint bar
+                  Row(
+                    children: [
+                      Material(
                         color: Colors.white,
-                        borderRadius: BorderRadius.circular(12),
-                        boxShadow: [
-                          BoxShadow(
-                            color: Colors.black.withValues(alpha: 0.1),
-                            blurRadius: 6,
+                        shape: const CircleBorder(),
+                        elevation: 2,
+                        child: InkWell(
+                          customBorder: const CircleBorder(),
+                          onTap: () => Navigator.pop(context),
+                          child: const Padding(
+                            padding: EdgeInsets.all(10),
+                            child: Icon(Icons.arrow_back, size: 20),
                           ),
-                        ],
+                        ),
                       ),
-                      child: const Row(
-                        children: [
-                          Icon(Icons.touch_app_outlined,
-                              size: 16, color: Color(0xFF2563EB)),
-                          SizedBox(width: 8),
-                          Text(
-                            'Pan to your location, then confirm',
-                            style: TextStyle(
-                                fontSize: 13, color: Colors.black87),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 14, vertical: 10),
+                          decoration: BoxDecoration(
+                            color: Colors.white,
+                            borderRadius: BorderRadius.circular(12),
+                            boxShadow: [
+                              BoxShadow(
+                                color: Colors.black.withValues(alpha: 0.1),
+                                blurRadius: 6,
+                              ),
+                            ],
                           ),
-                        ],
+                          child: Row(
+                            children: [
+                              Icon(
+                                _tappedLocation == null
+                                    ? Icons.touch_app_outlined
+                                    : Icons.location_on,
+                                size: 16,
+                                color: const Color(0xFF2563EB),
+                              ),
+                              const SizedBox(width: 8),
+                              Text(
+                                _tappedLocation == null
+                                    ? 'Long-press to pin \u00b7 tap for place info'
+                                    : 'Pinned \u2014 confirm or long-press to move',
+                                style: const TextStyle(
+                                    fontSize: 13, color: Colors.black87),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  // Previously marked locations chip strip
+                  if (widget.knownLocations.isNotEmpty) ...[
+                    const SizedBox(height: 8),
+                    SingleChildScrollView(
+                      scrollDirection: Axis.horizontal,
+                      child: Row(
+                        children: widget.knownLocations.map((loc) {
+                          return Padding(
+                            padding: const EdgeInsets.only(right: 6),
+                            child: GestureDetector(
+                              onTap: () {
+                                Navigator.pop(context, loc);
+                              },
+                              child: Container(
+                                padding: const EdgeInsets.symmetric(
+                                    horizontal: 10, vertical: 6),
+                                decoration: BoxDecoration(
+                                  color: Colors.white,
+                                  borderRadius: BorderRadius.circular(20),
+                                  boxShadow: [
+                                    BoxShadow(
+                                      color:
+                                          Colors.black.withValues(alpha: 0.1),
+                                      blurRadius: 4,
+                                    ),
+                                  ],
+                                ),
+                                child: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    const Icon(Icons.history_rounded,
+                                        size: 12,
+                                        color: Color(0xFF2563EB)),
+                                    const SizedBox(width: 5),
+                                    Text(
+                                      loc.address,
+                                      style: const TextStyle(
+                                          fontSize: 12,
+                                          fontWeight: FontWeight.w500),
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          );
+                        }).toList(),
                       ),
                     ),
-                  ),
+                  ],
                 ],
               ),
             ),
@@ -1559,9 +2061,9 @@ class _LocationPickerScreenState extends State<_LocationPickerScreen> {
                   final pos = await Geolocator.getCurrentPosition(
                     desiredAccuracy: LocationAccuracy.medium,
                   );
+                  final myLoc = LatLng(pos.latitude, pos.longitude);
                   _ctrl?.animateCamera(
-                    CameraUpdate.newLatLngZoom(
-                        LatLng(pos.latitude, pos.longitude), 16),
+                    CameraUpdate.newLatLngZoom(myLoc, 16),
                   );
                 } catch (_) {}
               },
@@ -1574,13 +2076,14 @@ class _LocationPickerScreenState extends State<_LocationPickerScreen> {
             left: 32,
             right: 32,
             child: FilledButton.icon(
-              onPressed: _confirm,
+              onPressed: _tappedLocation != null ? _confirm : null,
               icon: const Icon(Icons.check_rounded),
               label: const Text('Confirm Location',
                   style: TextStyle(
                       fontSize: 15, fontWeight: FontWeight.w600)),
               style: FilledButton.styleFrom(
                 backgroundColor: const Color(0xFF2563EB),
+                disabledBackgroundColor: Colors.grey[300],
                 padding: const EdgeInsets.symmetric(vertical: 16),
                 shape: RoundedRectangleBorder(
                     borderRadius: BorderRadius.circular(14)),

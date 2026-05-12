@@ -22,11 +22,32 @@ class _EmailVerificationScreenState extends State<EmailVerificationScreen> {
   final _codeController = TextEditingController();
   bool _isLoading = false;
   String? _error;
+  bool _isResending = false;
+  String? _resendMessage;
 
   @override
   void dispose() {
     _codeController.dispose();
     super.dispose();
+  }
+
+  Future<void> _resendCode() async {
+    setState(() {
+      _isResending = true;
+      _resendMessage = null;
+      _error = null;
+    });
+
+    final result =
+        await AuthService.resendVerificationEmail(email: widget.email);
+
+    if (!mounted) return;
+    setState(() {
+      _isResending = false;
+      _resendMessage = result.success
+          ? 'A new code has been sent to ${widget.email}.'
+          : (result.generalError ?? 'Failed to resend. Please try again.');
+    });
   }
 
   Future<void> _submitCode() async {
@@ -147,6 +168,33 @@ class _EmailVerificationScreenState extends State<EmailVerificationScreen> {
                     : const Text('Verify Email', style: TextStyle(fontSize: 16)),
               ),
               const SizedBox(height: 16),
+
+              // Resend feedback message
+              if (_resendMessage != null)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 12),
+                  child: Text(
+                    _resendMessage!,
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      fontSize: 13,
+                      color: _resendMessage!.startsWith('A new code')
+                          ? Colors.green[700]
+                          : Colors.red[700],
+                    ),
+                  ),
+                ),
+
+              TextButton(
+                onPressed: _isResending ? null : _resendCode,
+                child: _isResending
+                    ? const SizedBox(
+                        height: 16,
+                        width: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Text("Didn't receive a code? Resend"),
+              ),
 
               OutlinedButton(
                 onPressed: () => context.go(Routes.login),

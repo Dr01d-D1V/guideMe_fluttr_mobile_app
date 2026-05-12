@@ -1,17 +1,18 @@
 import 'dart:convert';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:http/http.dart' as http;
-import '../services/auth_service.dart';
+import '../services/api_client.dart';
 import '../models/route_entry.dart';
 
-const String _baseUrl = 'http://10.0.2.2:8000';
+// const String _baseUrl = 'http://192.168.100.35:8000';
+const String _baseUrl = 'http://192.168.18.8:8000';
 
 class ApiService {
   final http.Client _client;
   ApiService(this._client);
 
   Future<Map<String, String>> _authHeaders() async {
-    final token = await AuthService.getAccessToken();
+    final token = await ApiClient.getAccessToken();
     return {
       'Content-Type': 'application/json',
       if (token != null) 'Authorization': 'Bearer $token',
@@ -60,7 +61,7 @@ class ApiService {
     final headers = await _authHeaders();
     final response = await _client.get(
       Uri.parse(
-        '$_baseUrl/directions'
+        '$_baseUrl/maps/directions'
         '?origin=$originLat,$originLng'
         '&destination=$destLat,$destLng'
         '&alternatives=true',
