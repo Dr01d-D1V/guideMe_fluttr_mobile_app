@@ -81,13 +81,18 @@ class _SignupScreenState extends State<SignupScreen> {
       if (!mounted) return;
 
       if (response.success) {
-        context.go(
-          Routes.emailVerification,
-          extra: {
-            'email': _emailController.text.trim(),
-            'user': response.user,
-          },
-        );
+        if (response.effectiveResumeStep == 'email_verification' ||
+            response.effectiveResumeStep == null) {
+          context.go(
+            Routes.emailVerification,
+            extra: {
+              'email': _emailController.text.trim(),
+              'user': response.user,
+            },
+          );
+        } else {
+          context.go(Routes.fromResumeStep(response.effectiveResumeStep));
+        }
       } else if (response.fieldErrors != null) {
         setState(() {
           _emailError = response.fieldErrors!['email'];
@@ -115,7 +120,17 @@ class _SignupScreenState extends State<SignupScreen> {
     setState(() => _isGoogleLoading = false);
 
     if (response.success) {
-      context.go(Routes.home);
+      if (response.effectiveResumeStep == 'email_verification') {
+        context.go(
+          Routes.emailVerification,
+          extra: {
+            'email': response.user?['email'] as String? ?? '',
+            'user': response.user,
+          },
+        );
+      } else {
+        context.go(Routes.fromResumeStep(response.effectiveResumeStep));
+      }
     } else {
       setState(() => _generalError = response.generalError);
     }

@@ -9,7 +9,6 @@ import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
 import '../../models/destination.dart';
 import '../../models/route_entry.dart';
-import '../../providers/onboarding_provider.dart';
 import '../../services/api_service.dart';
 import '../../router/route_config.dart';
 
@@ -728,6 +727,17 @@ class _TravelPatternScreenState extends ConsumerState<TravelPatternScreen>
 
   // ─── Submit ───────────────────────────────────────────────────────────────
 
+  /// Returns true if [label] looks like a home address.
+  static bool _isHomeLabel(String label) {
+    final l = label.toLowerCase().trim();
+    return l == 'home' ||
+        l == 'house' ||
+        l == 'my home' ||
+        l == 'my house' ||
+        l.startsWith('home ') ||
+        l.endsWith(' home');
+  }
+
   Future<void> _submit() async {
     final allTrips = _tripsByDay.values
         .expand((list) => list)
@@ -747,7 +757,8 @@ class _TravelPatternScreenState extends ConsumerState<TravelPatternScreen>
 
     try {
       final tripPayloads = <Map<String, dynamic>>[];
-      final routeEntries = <RouteEntry>[];
+      final routeSelections = <Map<String, dynamic>>[];
+      LocationResult? homeLocation;
 
       for (int d = 0; d < 7; d++) {
         final trips = _tripsByDay[d]!;
@@ -758,6 +769,12 @@ class _TravelPatternScreenState extends ConsumerState<TravelPatternScreen>
           final stopPayloads = trip.stops.asMap().entries.map((e) {
             final idx = e.key;
             final s = e.value;
+
+            // Capture the first stop labelled "home" (or synonym).
+            if (homeLocation == null && _isHomeLabel(s.label)) {
+              homeLocation = s.location;
+            }
+
             return {
               'location': s.location!.toJson(),
               'label': s.label,
@@ -780,34 +797,48 @@ class _TravelPatternScreenState extends ConsumerState<TravelPatternScreen>
             'stops': stopPayloads,
           });
 
+          // Build route-selection entries for each segment that has a route chosen.
           for (int seg = 0; seg < trip.segmentCount; seg++) {
             if (seg >= trip.segmentRoutes.length) continue;
             final sr = trip.segmentRoutes[seg];
             if (sr.routes.isEmpty) continue;
             final sel = sr.routes[sr.selectedIndex];
-            routeEntries.add(RouteEntry(
-              tripLabel:
-                  '${trip.stops[seg].label} -> ${trip.stops[seg + 1].label} '
-                  '(${_dayFull[d]}, trip ${ti + 1}, seg ${seg + 1})',
-              fromDestinationId: trip.stops[seg].label,
-              toDestinationId: trip.stops[seg + 1].label,
-              estimatedDurationMinutes: sel.durationMinutes,
-              roadNames: sel.roadNames,
-              preferred: true,
-            ));
+            routeSelections.add({
+              'day': _dayKeys[d],
+              'trip_index': ti,
+              'segment_index': seg,
+              'from_label': trip.stops[seg].label,
+              'to_label': trip.stops[seg + 1].label,
+              'transport': trip.transport.label.toLowerCase(),
+              'encoded_polyline': sel.encodedPolyline,
+              'road_names': sel.roadNames,
+              'duration_minutes': sel.durationMinutes,
+              'distance_km': sel.distanceKm,
+            });
           }
         }
       }
 
       final api = ref.read(apiServiceProvider);
-      await api.saveTravelPatterns({'trips': tripPayloads});
 
-      if (routeEntries.isNotEmpty) {
-        await api.saveRoutes(
-            {'routes': routeEntries.map((r) => r.toJson()).toList()});
-      }
+      // Fire travel-pattern and route-selection in parallel.
+      // Home-location only sent if a home stop was detected.
+      final futures = <Future>[
+        api.saveTravelPatterns({'trips': tripPayloads}),
+        if (routeSelections.isNotEmpty)
+          api.saveRouteSelection({'routes': routeSelections}),
+        if (homeLocation != null)
+          api.saveHomeLocation({
+            'location': {
+              'name': 'Home',
+              'latitude': homeLocation!.lat,
+              'longitude': homeLocation!.lng,
+              'address': homeLocation!.address,
+            },
+          }),
+      ];
 
-      ref.read(onboardingProvider.notifier).setRoutes(routeEntries);
+      await Future.wait(futures);
 
       if (mounted) context.go(Routes.onboardingAlertPreferences);
     } catch (e) {

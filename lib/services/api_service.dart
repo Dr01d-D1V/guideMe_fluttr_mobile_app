@@ -1,11 +1,11 @@
 import 'dart:convert';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:http/http.dart' as http;
+import '../config/app_config.dart';
 import '../services/api_client.dart';
 import '../models/route_entry.dart';
 
-// const String _baseUrl = 'http://192.168.100.35:8000';
-const String _baseUrl = 'http://192.168.18.8:8000';
+String get _baseUrl => AppConfig.baseUrl;
 
 class ApiService {
   final http.Client _client;
@@ -22,33 +22,65 @@ class ApiService {
   Future<Map<String, dynamic>> saveTravelPatterns(
       Map<String, dynamic> payload) async {
     final headers = await _authHeaders();
-    final response = await _client.post(
-      Uri.parse('$_baseUrl/onboarding/travel-pattern'),
-      headers: headers,
-      body: jsonEncode(payload),
-    );
+    final response = await _client
+        .post(
+          Uri.parse('$_baseUrl/onboarding/travel-pattern'),
+          headers: headers,
+          body: jsonEncode(payload),
+        )
+        .timeout(const Duration(seconds: 30));
     return _handle(response);
   }
 
   Future<Map<String, dynamic>> saveRoutes(
       Map<String, dynamic> payload) async {
     final headers = await _authHeaders();
-    final response = await _client.post(
-      Uri.parse('$_baseUrl/onboarding/routes'),
-      headers: headers,
-      body: jsonEncode(payload),
-    );
+    final response = await _client
+        .post(
+          Uri.parse('$_baseUrl/onboarding/routes'),
+          headers: headers,
+          body: jsonEncode(payload),
+        )
+        .timeout(const Duration(seconds: 30));
+    return _handle(response);
+  }
+
+  Future<Map<String, dynamic>> saveHomeLocation(
+      Map<String, dynamic> payload) async {
+    final headers = await _authHeaders();
+    final response = await _client
+        .post(
+          Uri.parse('$_baseUrl/onboarding/home-location'),
+          headers: headers,
+          body: jsonEncode(payload),
+        )
+        .timeout(const Duration(seconds: 15));
+    return _handle(response);
+  }
+
+  Future<Map<String, dynamic>> saveRouteSelection(
+      Map<String, dynamic> payload) async {
+    final headers = await _authHeaders();
+    final response = await _client
+        .post(
+          Uri.parse('$_baseUrl/onboarding/route-selection'),
+          headers: headers,
+          body: jsonEncode(payload),
+        )
+        .timeout(const Duration(seconds: 30));
     return _handle(response);
   }
 
   Future<Map<String, dynamic>> saveAlertPreferences(
       Map<String, dynamic> payload) async {
     final headers = await _authHeaders();
-    final response = await _client.post(
-      Uri.parse('$_baseUrl/onboarding/alert-preferences'),
-      headers: headers,
-      body: jsonEncode(payload),
-    );
+    final response = await _client
+        .post(
+          Uri.parse('$_baseUrl/onboarding/alert-preferences'),
+          headers: headers,
+          body: jsonEncode(payload),
+        )
+        .timeout(const Duration(seconds: 30));
     return _handle(response);
   }
 
@@ -59,15 +91,17 @@ class ApiService {
     double destLng,
   ) async {
     final headers = await _authHeaders();
-    final response = await _client.get(
-      Uri.parse(
-        '$_baseUrl/maps/directions'
-        '?origin=$originLat,$originLng'
-        '&destination=$destLat,$destLng'
-        '&alternatives=true',
-      ),
-      headers: headers,
-    );
+    final response = await _client
+        .get(
+          Uri.parse(
+            '$_baseUrl/maps/directions'
+            '?origin=$originLat,$originLng'
+            '&destination=$destLat,$destLng'
+            '&alternatives=true',
+          ),
+          headers: headers,
+        )
+        .timeout(const Duration(seconds: 30));
     final data = _handle(response);
     return (data['routes'] as List<dynamic>? ?? [])
         .map((r) => RouteOption.fromJson(r as Map<String, dynamic>))

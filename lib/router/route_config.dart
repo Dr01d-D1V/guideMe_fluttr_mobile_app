@@ -8,6 +8,8 @@ import '../screens/email_verification_screen.dart';
 import '../screens/otp_verification_screen.dart';
 import '../screens/onboarding/email_verified_screen.dart';
 import '../screens/onboarding/agent_intro_screen.dart';
+import '../screens/onboarding/location_permission_screen.dart';
+import '../screens/onboarding/home_location_screen.dart';
 import '../screens/onboarding/travel_pattern_screen.dart';
 import '../screens/onboarding/route_selection_screen.dart';
 import '../screens/onboarding/alert_preferences_screen.dart';
@@ -23,9 +25,30 @@ class Routes {
   static const otpVerification = '/otp-verification';
   static const onboardingVerified = '/onboarding/verified';
   static const onboardingIntro = '/onboarding/intro';
+  static const locationPermission = '/onboarding/location-permission';
+  static const homeLocation = '/onboarding/home-location';
   static const onboardingTravelPatterns = '/onboarding/travel-patterns';
   static const onboardingRoutes = '/onboarding/routes';
   static const onboardingAlertPreferences = '/onboarding/alert-preferences';
+
+  /// Maps a `resume_step` string from GET /auth/me to the corresponding route.
+  /// `home_location` is collected inside TravelPatternScreen, so it maps
+  /// directly to travel-patterns.
+  static String fromResumeStep(String? step) {
+    switch (step) {
+      case 'email_verification':
+        return emailVerification;
+      case 'location_permission':
+        return locationPermission;
+      case 'home_location': // home location is captured in travel_patterns
+      case 'travel_patterns':
+        return onboardingTravelPatterns;
+      case 'alert_preferences':
+        return onboardingAlertPreferences;
+      default:
+        return home;
+    }
+  }
 }
 
 final GoRouter appRouter = GoRouter(
@@ -79,6 +102,14 @@ final GoRouter appRouter = GoRouter(
     GoRoute(
       path: Routes.onboardingIntro,
       builder: (context, state) => const AgentIntroScreen(),
+    ),
+    GoRoute(
+      path: Routes.locationPermission,
+      builder: (context, state) => const LocationPermissionScreen(),
+    ),
+    GoRoute(
+      path: Routes.homeLocation,
+      builder: (context, state) => const HomeLocationScreen(),
     ),
     GoRoute(
       path: Routes.onboardingTravelPatterns,

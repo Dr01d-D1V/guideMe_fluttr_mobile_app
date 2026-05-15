@@ -82,6 +82,22 @@ class _LoginScreenState extends State<LoginScreen> {
     return null;
   }
 
+  // ─── Navigation helper ───────────────────────────────────────
+
+  void _navigateFromOnboarding(AuthResponse response, {String? email}) {
+    if (response.effectiveResumeStep == 'email_verification') {
+      context.go(
+        Routes.emailVerification,
+        extra: {
+          'email': email ?? response.user?['email'] as String? ?? '',
+          'user': response.user,
+        },
+      );
+    } else {
+      context.go(Routes.fromResumeStep(response.effectiveResumeStep));
+    }
+  }
+
   // ─── Email/Password Sign In ─────────────────────────────────
 
   Future<void> _handleEmailPassSignIn() async {
@@ -99,7 +115,10 @@ class _LoginScreenState extends State<LoginScreen> {
       if (!mounted) return;
 
       if (response.success) {
-        context.go(Routes.home);
+        _navigateFromOnboarding(
+          response,
+          email: _emailController.text.trim(),
+        );
       } else if (response.fieldErrors != null) {
         setState(() {
           _emailError = response.fieldErrors!['email'];
@@ -122,8 +141,8 @@ class _LoginScreenState extends State<LoginScreen> {
 
     setState(() => _isLoading = true);
 
-    final contact = _contactController.text.trim();
-    final response = await _authService.sendOtp(contact: contact);
+    final email = _contactController.text.trim();
+    final response = await _authService.sendOtp(email: email);
 
     if (!mounted) return;
     setState(() => _isLoading = false);
@@ -132,7 +151,7 @@ class _LoginScreenState extends State<LoginScreen> {
       context.push(
         Routes.otpVerification,
         extra: {
-          'contact': contact,
+          'contact': email,
           'deviceId': response.deviceId!,
           'preAuthSessionId': response.preAuthSessionId!,
         },
@@ -156,7 +175,7 @@ class _LoginScreenState extends State<LoginScreen> {
     setState(() => _isGoogleLoading = false);
 
     if (response.success) {
-      context.go(Routes.home);
+      _navigateFromOnboarding(response);
     } else {
       setState(() => _generalError = response.generalError);
     }

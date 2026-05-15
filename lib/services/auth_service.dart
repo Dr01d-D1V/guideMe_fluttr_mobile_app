@@ -3,11 +3,11 @@ import 'package:http/http.dart' as http;
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:google_sign_in/google_sign_in.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import '../config/app_config.dart';
 import 'api_client.dart';
 
 class AuthService {
-  // static const String baseUrl = 'http://192.168.100.35:8000';
-  static const String baseUrl = 'http://192.168.18.8:8000';
+  static String get baseUrl => AppConfig.baseUrl;
 
   // Lazily instantiated so Google Play Services IPC is deferred until
   // the user actually taps "Continue with Google".
@@ -84,7 +84,15 @@ class AuthService {
       if (response.statusCode == 200 && data['status'] == 'OK') {
         await _saveSession(data['user'] ?? {});
         await ApiClient.saveSession(response);
-        return AuthResponse(success: true, user: data['user']);
+        // Onboarding is embedded in the signup response. Fall back to
+        // /auth/me only if the backend omits it.
+        final onboarding = data['onboarding'] as Map<String, dynamic>?
+            ?? (await ApiClient.fetchMe())?['onboarding'] as Map<String, dynamic>?;
+        return AuthResponse(
+          success: true,
+          user: data['user'],
+          onboarding: onboarding,
+        );
       } else if (data['status'] == 'FIELD_ERROR') {
         final errors = <String, String>{};
         for (var field in data['formFields']) {
@@ -124,7 +132,15 @@ class AuthService {
       if (response.statusCode == 200 && data['status'] == 'OK') {
         await _saveSession(data['user'] ?? {});
         await ApiClient.saveSession(response);
-        return AuthResponse(success: true, user: data['user']);
+        // Onboarding is embedded in the signin response. Fall back to
+        // /auth/me only if the backend omits it.
+        final onboarding = data['onboarding'] as Map<String, dynamic>?
+            ?? (await ApiClient.fetchMe())?['onboarding'] as Map<String, dynamic>?;
+        return AuthResponse(
+          success: true,
+          user: data['user'],
+          onboarding: onboarding,
+        );
       } else if (data['status'] == 'FIELD_ERROR') {
         final errors = <String, String>{};
         for (var field in data['formFields']) {
@@ -188,10 +204,13 @@ class AuthService {
       if (response.statusCode == 200 && data['status'] == 'OK') {
         await _saveSession(data['user'] ?? {});
         await ApiClient.saveSession(response);
+        final onboarding = data['onboarding'] as Map<String, dynamic>?
+            ?? (await ApiClient.fetchMe())?['onboarding'] as Map<String, dynamic>?;
         return AuthResponse(
           success: true,
           user: data['user'],
           isNewUser: data['createdNewUser'] ?? false,
+          onboarding: onboarding,
         );
       } else {
         await _googleSignIn.signOut();
@@ -207,16 +226,12 @@ class AuthService {
   }
 
   // ─── Passwordless OTP: Send Code ────────────────────────────
-  Future<OtpResponse> sendOtp({required String contact}) async {
+  Future<OtpResponse> sendOtp({required String email}) async {
     try {
-      final isEmail = contact.contains('@');
-
       final response = await http.post(
-        Uri.parse('$baseUrl/auth/signinup/code'),
+        Uri.parse('$baseUrl/auth/passwordless/start'),
         headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({
-          if (isEmail) 'email': contact else 'phoneNumber': contact,
-        }),
+        body: jsonEncode({'email': email}),
       );
 
       final data = jsonDecode(response.body);
@@ -226,7 +241,6 @@ class AuthService {
           success: true,
           deviceId: data['deviceId'],
           preAuthSessionId: data['preAuthSessionId'],
-          flowType: data['flowType'],
         );
       } else {
         return OtpResponse(
@@ -240,19 +254,18 @@ class AuthService {
   }
 
   // ─── Passwordless OTP: Verify Code ──────────────────────────
+  // Onboarding state is embedded in the response — no /auth/me call needed.
   Future<AuthResponse> verifyOtp({
     required String preAuthSessionId,
-    required String deviceId,
     required String code,
   }) async {
     try {
       final response = await http.post(
-        Uri.parse('$baseUrl/auth/signinup/code/consume'),
+        Uri.parse('$baseUrl/auth/passwordless/verify'),
         headers: {'Content-Type': 'application/json'},
         body: jsonEncode({
-          'preAuthSessionId': preAuthSessionId,
-          'deviceId': deviceId,
-          'userInputCode': code,
+          'pre_auth_session_id': preAuthSessionId,
+          'user_input_code': code,
         }),
       );
 
@@ -265,6 +278,7 @@ class AuthService {
           success: true,
           user: data['user'],
           isNewUser: data['createdNewUser'] ?? false,
+          onboarding: data['onboarding'] as Map<String, dynamic>?,
         );
       } else if (data['status'] == 'INCORRECT_USER_INPUT_CODE_ERROR') {
         return AuthResponse(
@@ -289,33 +303,9 @@ class AuthService {
   }
 
   // ─── Resend OTP ─────────────────────────────────────────────
-  Future<OtpResponse> resendOtp({
-    required String deviceId,
-    required String preAuthSessionId,
-  }) async {
-    try {
-      final response = await http.post(
-        Uri.parse('$baseUrl/auth/signinup/code/resend'),
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({
-          'deviceId': deviceId,
-          'preAuthSessionId': preAuthSessionId,
-        }),
-      );
-
-      final data = jsonDecode(response.body);
-
-      if (response.statusCode == 200 && data['status'] == 'OK') {
-        return OtpResponse(success: true);
-      } else {
-        return OtpResponse(
-          success: false,
-          error: data['message'] ?? 'Failed to resend OTP',
-        );
-      }
-    } catch (e) {
-      return OtpResponse(success: false, error: 'Network error: $e');
-    }
+  // Re-starts a new passwordless session for the same email.
+  Future<OtpResponse> resendOtp({required String email}) async {
+    return sendOtp(email: email);
   }
 
   // ─── Email Code Verification ─────────────────────────────────
@@ -385,6 +375,47 @@ class AuthResponse {
   final Map<String, String>? fieldErrors;
   final String? generalError;
   final bool isNewUser;
+  final Map<String, dynamic>? onboarding;
+
+  /// The `resume_step` value from the onboarding payload, or null.
+  String? get resumeStep => onboarding?['resume_step'] as String?;
+
+  /// True when the backend reports onboarding is fully complete.
+  bool get onboardingComplete => onboarding?['onboarding_complete'] == true;
+
+  /// Like [resumeStep], but corrects for the case where the backend returns
+  /// `resume_step: "email_verification"` while the step data already shows
+  /// `email_verified: true`. In that case, walk the steps list to find the
+  /// first entry where `completed != true` and return that step name instead.
+  String? get effectiveResumeStep {
+    final step = resumeStep;
+    if (step != 'email_verification') return step;
+
+    final steps = onboarding?['steps'] as List?;
+    if (steps == null) return step;
+
+    // Check whether email is actually verified in the step data.
+    bool emailActuallyVerified = false;
+    for (final s in steps) {
+      final m = s as Map<String, dynamic>;
+      if (m['step'] == 'email_verification') {
+        final d = m['data'] as Map<String, dynamic>?;
+        emailActuallyVerified = d?['email_verified'] == true;
+        break;
+      }
+    }
+
+    if (!emailActuallyVerified) return step; // email really not verified yet
+
+    // Email is verified — find the first genuinely incomplete step.
+    for (final s in steps) {
+      final m = s as Map<String, dynamic>;
+      if (m['step'] != 'email_verification' && m['completed'] != true) {
+        return m['step'] as String?;
+      }
+    }
+    return null; // all steps done → home
+  }
 
   AuthResponse({
     required this.success,
@@ -392,6 +423,7 @@ class AuthResponse {
     this.fieldErrors,
     this.generalError,
     this.isNewUser = false,
+    this.onboarding,
   });
 }
 

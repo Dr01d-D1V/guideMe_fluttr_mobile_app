@@ -30,13 +30,11 @@ class _OtpVerificationScreenState extends State<OtpVerificationScreen> {
   bool _isResending = false;
   String? _error;
 
-  late String _deviceId;
   late String _preAuthSessionId;
 
   @override
   void initState() {
     super.initState();
-    _deviceId = widget.deviceId;
     _preAuthSessionId = widget.preAuthSessionId;
   }
 
@@ -86,7 +84,6 @@ class _OtpVerificationScreenState extends State<OtpVerificationScreen> {
 
     final response = await _authService.verifyOtp(
       preAuthSessionId: _preAuthSessionId,
-      deviceId: _deviceId,
       code: code,
     );
 
@@ -95,7 +92,6 @@ class _OtpVerificationScreenState extends State<OtpVerificationScreen> {
     setState(() => _isLoading = false);
 
     if (response.success) {
-      // Show success and navigate to home
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
@@ -104,7 +100,7 @@ class _OtpVerificationScreenState extends State<OtpVerificationScreen> {
           backgroundColor: Colors.green,
         ),
       );
-      context.go(Routes.home);
+      context.go(Routes.fromResumeStep(response.effectiveResumeStep));
     } else {
       setState(() => _error = response.generalError);
       // Clear OTP fields on error
@@ -122,8 +118,7 @@ class _OtpVerificationScreenState extends State<OtpVerificationScreen> {
     });
 
     final response = await _authService.resendOtp(
-      deviceId: _deviceId,
-      preAuthSessionId: _preAuthSessionId,
+      email: widget.contact,
     );
 
     if (!mounted) return;
@@ -131,6 +126,10 @@ class _OtpVerificationScreenState extends State<OtpVerificationScreen> {
     setState(() => _isResending = false);
 
     if (response.success) {
+      // Update session IDs from the fresh OTP
+      setState(() {
+        _preAuthSessionId = response.preAuthSessionId!;
+      });
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
           content: Text('OTP resent successfully!'),

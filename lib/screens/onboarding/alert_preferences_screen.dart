@@ -111,10 +111,23 @@ class _AlertPreferencesScreenState
     try {
       final api = ref.read(apiServiceProvider);
       await api.saveAlertPreferences({
-        'alert_preferences': _selectedAlerts.toList(),
-        'alert_radius_meters': _alertRadiusMeters,
-        'notify_before_trip_minutes': _notifyBeforeMinutes,
-        'notify_en_route': _notifyEnRoute,
+        'alert_traffic_congestion': _selectedAlerts.contains('traffic_congestion'),
+        'alert_road_closures': _selectedAlerts.contains('road_closure'),
+        'alert_accidents': _selectedAlerts.contains('accident'),
+        'alert_construction': _selectedAlerts.contains('road_construction'),
+        'alert_protests_riots': _selectedAlerts.contains('protest_riot'),
+        'alert_terror_warnings': _selectedAlerts.contains('terror_threat'),
+        'alert_police_deployment': _selectedAlerts.contains('security_deployment'),
+        'alert_military_deployment': _selectedAlerts.contains('security_deployment'),
+        'alert_curfew': _selectedAlerts.contains('curfew'),
+        'alert_crime_reports': false,
+        'alert_severe_weather': false,
+        'alert_flooding': _selectedAlerts.contains('flooding'),
+        'alert_poor_visibility': false,
+        'alert_route_optimization': true,
+        'notification_lead_time_minutes': _notifyBeforeMinutes,
+        'quiet_hours_start': null,
+        'quiet_hours_end': null,
       });
       if (mounted) context.go(Routes.home);
     } catch (e) {
